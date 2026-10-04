@@ -749,7 +749,8 @@ interface UnitClaimIdentity {
   intentId8: string;
 }
 
-function cachedClaimsForIdentity(
+// Local refs and cached observations only; never fetch or refresh the cache.
+export function cachedClaimsForIdentity(
   projectDir: string,
   identity: UnitClaimIdentity,
   includeCache: boolean,

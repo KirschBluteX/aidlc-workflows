@@ -1478,3 +1478,46 @@ describe("t324 doctor stage drift against the engine (#1190)", () => {
     expect(recovery.message).toContain("--result skipped");
   }, 60000);
 });
+
+describe("t324 scope-change Unit topology (#1401)", () => {
+  test("refuses feature to refactor at a later Unit gate without abandoning the gate", () => {
+    const proj = seedProject({ ownership: "team", rhythm: "per-stage" });
+    writeFileSync(seededStateFile(proj), state(proj).replace(
+      "## Stage Progress\n",
+      "## Stage Progress\n<!-- Checkbox states: [ ] not started -->\n",
+    ));
+    const first = runNext(proj);
+    settleBody(proj, first);
+    approveGate(proj, runNext(proj));
+    const later = runNext(proj);
+    expect(later).toMatchObject({ stage: "nfr-requirements", unit: "alpha", gate: false });
+    settleBody(proj, later);
+    const gate = runNext(proj);
+    expect(gate).toMatchObject({ stage: "nfr-requirements", unit: "alpha", unit_gate: "per-stage", gate: true });
+    expect(runReport(proj, [
+      "--stage", "nfr-requirements", "--unit", "alpha", "--result", "awaiting-approval",
+    ]).kind).toBe("print");
+    expect(state(proj)).toContain("- **Current Stage**: functional-design");
+    const before = state(proj);
+    const auditBefore = readAllAuditShards(proj);
+    const changed = spawnSync(BUN, [
+      UTIL, "scope-change", "--scope", "refactor", "--project-dir", proj,
+    ], { encoding: "utf-8", env: ENV, timeout: NATIVE_STARTUP_TIMEOUT_MS });
+    expect(changed.status, changed.stdout + changed.stderr).toBe(1);
+    expect(state(proj)).toBe(before);
+    expect(readAllAuditShards(proj)).toBe(auditBefore);
+    expect(runNext(proj)).toMatchObject({
+      stage: "nfr-requirements", unit: "alpha", unit_gate: "per-stage", gate: true,
+    });
+    const retained = spawnSync(BUN, [
+      UTIL, "scope-change", "--scope", "mvp", "--project-dir", proj,
+    ], { encoding: "utf-8", env: ENV, timeout: NATIVE_STARTUP_TIMEOUT_MS });
+    expect(retained.status, retained.stdout + retained.stderr).toBe(0);
+    const sameGate = runNext(proj);
+    expect(sameGate).toMatchObject({
+      stage: "nfr-requirements", unit: "alpha", unit_gate: "per-stage", gate: true,
+    });
+    approveGate(proj, sameGate);
+    expect(runNext(proj)).toMatchObject({ stage: "nfr-design", unit: "alpha", gate: false });
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+});

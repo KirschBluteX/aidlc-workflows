@@ -122,6 +122,7 @@ import {
 } from "./aidlc-config-diagnostics.ts";
 import {
   type cachedUnitClaimOverview,
+  cachedClaimsForIdentity,
   localUnitClaimOverviewForIntent,
   main as unitMain,
 } from "./aidlc-unit.ts";
@@ -329,6 +330,12 @@ import {
   clearSessionIntentUuid,
   sourceBaselineAuditFields,
   unitDependencyPath,
+  unitPlanChangeRefusal,
+  unitMajorConstructionStageSlugs,
+  usesStageLevelPerUnitArtifacts,
+  intentUuidForSelection,
+  unitMergeTransactionsForIdentity,
+  type WorkflowSelection,
   withAuditLock,
   validScopes,
   worktreeAuditFilePath,
@@ -522,10 +529,16 @@ const UPGRADE_UNAVAILABLE_MESSAGE =
   "upgrade is not available in this install; it arrives with the packaged binary distribution.";
 
 let errorArgs: string[] = [];
+let errorSubcommand: string | undefined;
 let errorProjectDirArg: string | undefined;
 let errorSelection: { intent?: string; space?: string } = {};
 
 function die(msg: string): never {
+  // Refused plan proposals must not mutate the selected workflow, including
+  // validation failures before handler dispatch and errors while reading it.
+  if (errorSubcommand === "scope-change" || errorSubcommand === "recompose") {
+    refusePlanChange(msg);
+  }
   // main(argv) seeds this context before dispatch so ERROR_LOGGED lands in the
   // same workflow the argv-selected command was targeting. Fall back to default
   // resolution (env var / cwd) for direct in-process helper calls.
@@ -10680,6 +10693,52 @@ function determineFirstPostInitStage(
 // scope-change — atomically change scope on an existing workflow
 // ---------------------------------------------------------------------------
 
+// Plan refusals leave both state and audit unchanged, including diagnostics.
+function refusePlanChange(message: string): never {
+  console.error(JSON.stringify({ error: message }));
+  process.exit(1);
+}
+
+function refuseUnitPlanChange(
+  projectDir: string,
+  before: string,
+  after: string,
+  selection: WorkflowSelection,
+): void {
+  const oldScope = getField(before, "Scope") ?? "";
+  const newScope = getField(after, "Scope") ?? "";
+  if (
+    usesStageLevelPerUnitArtifacts(oldScope, before) === usesStageLevelPerUnitArtifacts(newScope, after) &&
+    unitMajorConstructionStageSlugs(oldScope, before, true).join("\n") ===
+      unitMajorConstructionStageSlugs(newScope, after, true).join("\n")
+  ) return;
+  let refusal: string | null;
+  try {
+    // A claimant can be working in another checkout, so the local Unit ledger
+    // cannot prove that changing its plan is safe. Inspect local claim refs and
+    // the existing cache without fetching or refreshing either one.
+    const intentUuid = intentUuidForSelection(projectDir, selection);
+    if (isTeamUnitOwnership(before) && intentUuid) {
+      const claimed = [...cachedClaimsForIdentity(projectDir, {
+        space: selection.space, intentUuid, intentId8: idSuffix(intentUuid),
+      }, true).values()].filter((claim) => claim.status === "claimed");
+      const merging = unitMergeTransactionsForIdentity(projectDir, selection.space, intentUuid)
+        .filter((transaction) => transaction.status !== "complete");
+      if (claimed.length > 0 || merging.length > 0) {
+        refusePlanChange(
+          "Cannot change the Unit plan while Units are claimed or merging: " +
+          [...new Set([...claimed, ...merging].map((entry) => entry.unit))].join(", ") +
+          ". Finish or release the claims and complete their merges first.",
+        );
+      }
+    }
+    refusal = unitPlanChangeRefusal(projectDir, before, after, selection);
+  } catch (error) {
+    refusePlanChange(`Cannot verify the Unit plan: ${errorMessage(error)}`);
+  }
+  if (refusal !== null) refusePlanChange(`Cannot change the Unit plan: ${refusal}`);
+}
+
 function handleScopeChange(projectDir: string, flags: Record<string, string>): void {
   const newScope = flags.scope;
   if (!newScope) die("--scope is required for scope-change");
@@ -10932,6 +10991,7 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       ];
     }
     if (content !== contentBefore) {
+      refuseUnitPlanChange(projectDir, contentBefore, content, selection);
       try {
         if (auditEntries.some((entry) => entry.eventType === "GUARD_POLICY_SET")) assertChangeControlLedgerWritable();
         appendAuditEntries(auditEntries, projectDir, intent, space);
@@ -11092,14 +11152,11 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     die(`Cannot both --skip and --add the same stage: ${overlap.join(", ")}.`);
   }
 
-  const sp = stateFilePath(projectDir, flags.intent, flags.space);
-  if (!existsSync(sp)) {
-    die("No state file found. recompose re-shapes a RUNNING workflow; start one first.");
-  }
-
-  withAuditLock(projectDir, () => {
-    let content = readStateFile(projectDir, flags.intent, flags.space);
-    const before = content;
+  const applySelected = (selection: WorkflowSelection): void => withAuditLock(projectDir, () => {
+    const intent = selection.intent ?? undefined;
+    const space = selection.space;
+    let content = readStateFile(projectDir, intent, space);
+    const contentBefore = content;
     // AUTONOMY GUARD (mirrors the park guard's shape in aidlc-state.ts): an
     // unattended autonomous Construction run has no human at the gate, so a
     // conductor that drifts into "improving the plan" must not flip pending
@@ -11224,6 +11281,11 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
       );
     }
 
+    let candidate = content;
+    for (const slug of skipList) candidate = setStageSuffix(candidate, slug, "SKIP");
+    for (const slug of addList) candidate = setStageSuffix(candidate, slug, "EXECUTE");
+    refuseUnitPlanChange(projectDir, contentBefore, candidate, selection);
+
     // --- Build the proposed effective grid and validate STRICT --------------
     // Strictness is a DIFF against the pre-flip baseline: a stock scope may be
     // CREATED with structural advisories (e.g. bugfix's code-generation consumes
@@ -11268,8 +11330,7 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     }
 
     // --- Apply the suffix flips ---------------------------------------------
-    for (const slug of skipList) content = setStageSuffix(content, slug, "SKIP");
-    for (const slug of addList) content = setStageSuffix(content, slug, "EXECUTE");
+    content = candidate;
 
     // --- Rebuild the derived fields against the EFFECTIVE plan --------------
     const rebuilt = rebuildEffectivePlanFields(content, scope, scopeDef, currentSlug);
@@ -11279,7 +11340,7 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
     // The approved settings, applied to the recomposed content before the one write.
     const settingsUpdate = Object.keys(settings).length > 0
       ? applyIntentSettings(projectDir, content, settings, {
-          intent: flags.intent, space: flags.space, sessionId: readCurrentSessionId(projectDir), fail: die,
+          intent, space, sessionId: selection.sessionId, fail: die,
         })
       : { content, audit: [], lines: [] };
     content = setField(settingsUpdate.content, "Last Updated", isoTimestamp());
@@ -11298,11 +11359,11 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
         },
       },
       ...settingsUpdate.audit,
-    ], projectDir, flags.intent, flags.space);
+    ], projectDir, intent, space);
 
-    writeStateFile(projectDir, content, flags.intent, flags.space);
+    writeStateFile(projectDir, content, intent, space);
     try {
-      keepPlanApprovalAskOverStateWrite(projectDir, before, content);
+      keepPlanApprovalAskOverStateWrite(projectDir, contentBefore, content);
     } catch (e) {
       recordHookDrop(projectDir, "active-directive", errorMessage(e));
     }
@@ -11314,6 +11375,18 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
         `Completed: ${completedCount}/${executeStages.length}\n` +
         settingsUpdate.lines.map((line) => `${line}\n`).join(""),
     );
+  }, selection.intent ?? undefined, selection.space, WORKSPACE_MUTATION_LOCK_RETRIES);
+
+  // Preserve workspace serialization with intent creation. Resolve the target
+  // after that lock, then hold its intent lock so scope-change cannot race the
+  // Unit-plan check or the matching state/audit writes.
+  withAuditLock(projectDir, () => {
+    const selection = resolveWorkflowSelection(projectDir, { intent: flags.intent, space: flags.space });
+    const sp = stateFilePath(projectDir, selection.intent ?? undefined, selection.space);
+    if (!existsSync(sp)) {
+      die("No state file found. recompose re-shapes a RUNNING workflow; start one first.");
+    }
+    applySelected(selection);
   }, undefined, undefined, WORKSPACE_MUTATION_LOCK_RETRIES);
 }
 
@@ -12117,6 +12190,7 @@ export async function main(argv: string[]): Promise<void> {
   errorArgs = [...rawArgs];
   const { positional, flags, bareFlags, blankFlags } = parseArgs(rawArgs);
   const subcommand = positional[0];
+  errorSubcommand = subcommand;
   if (
     (subcommand === "intent-create" || subcommand === "init") &&
     (flags.help === "true" || rawArgs.includes("-h"))

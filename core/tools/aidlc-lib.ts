@@ -14501,8 +14501,11 @@ export function reviewArtifactEntries(
     boltDag?: BoltDagResolution;
     stateContent?: string | null;
     mergedBoltUnits?: ReadonlySet<string>;
+    selection?: WorkflowSelection;
   } = {},
 ): ReviewArtifactEntry[] | null {
+  const intent = options.selection?.intent ?? undefined;
+  const space = options.selection?.space;
   const artifactsForKind = (kind: string | null) => {
     const required = filterProducesByKind(
       stage.produces_kinds,
@@ -14531,8 +14534,8 @@ export function reviewArtifactEntries(
   const allArtifacts = artifactsForKind(null);
 
   if (KNOWN_CODEKB_STAGES.has(stage.slug)) {
-    const root = dirname(codekbDir(projectDir, "_"));
-    let repos = intentRepos(projectDir);
+    const root = dirname(codekbDir(projectDir, "_", space));
+    let repos = intentRepos(projectDir, intent, space);
     if (repos.length === 0 && existsSync(root)) {
       repos = readdirSync(root).filter((name) => {
         try {
@@ -14555,7 +14558,7 @@ export function reviewArtifactEntries(
     return repos.flatMap((repo) =>
       allArtifacts.map((artifact) => ({
         logicalPath: `codekb/${repo}/${artifactFilename(artifact.name)}`,
-        path: join(codekbDir(projectDir, repo), artifactFilename(artifact.name)),
+        path: join(codekbDir(projectDir, repo, space), artifactFilename(artifact.name)),
         boundary: root,
         required: artifact.required,
         reviewAppendixTarget: artifact.reviewAppendixTarget,
@@ -14564,7 +14567,7 @@ export function reviewArtifactEntries(
     );
   }
 
-  const record = recordDir(projectDir);
+  const record = recordDir(projectDir, intent, space);
   if (record === null) return null;
   if (stage.for_each !== "unit-of-work") {
     return allArtifacts.map((artifact) => ({
@@ -14608,7 +14611,7 @@ export function reviewArtifactEntries(
   let stateContent = options.stateContent;
   if (stateContent === undefined) {
     try {
-      stateContent = readStateFile(projectDir);
+      stateContent = readStateFile(projectDir, intent, space);
     } catch {
       stateContent = null;
     }
@@ -14627,7 +14630,7 @@ export function reviewArtifactEntries(
 
   let units: string[];
   let unitKinds = new Map<string, string>();
-  const resolution = options.boltDag ?? resolveBoltDag(projectDir);
+  const resolution = options.boltDag ?? resolveBoltDag(projectDir, intent, space);
   if (unit) {
     units = [unit];
     if (resolution.state === "ok" && resolution.unitKinds !== null) {
@@ -15130,11 +15133,13 @@ export function reviewArtifactFingerprint(
     boltDag?: BoltDagResolution;
     stateContent?: string | null;
     mergedBoltUnits?: ReadonlySet<string>;
+    selection?: WorkflowSelection;
   } = {},
 ): string | null {
   let entries: ReviewArtifactEntry[] | null;
   try {
     entries = reviewArtifactEntries(projectDir, stage, unit, {
+      selection: options.selection,
       boltDag: options.boltDag,
       stateContent: options.stateContent,
       mergedBoltUnits: options.mergedBoltUnits,
@@ -26061,9 +26066,9 @@ export function readClaimGenerations(
   }
 }
 
-function claimGenerationKey(projectDir: string, unit: string): string {
-  const space = activeSpace(projectDir);
-  const intentUuid = activeIntentUuid(projectDir, space) ?? "legacy";
+function claimGenerationKey(projectDir: string, unit: string, selection?: WorkflowSelection): string {
+  const space = selection?.space ?? activeSpace(projectDir);
+  const intentUuid = (selection ? intentUuidForSelection(projectDir, selection) : activeIntentUuid(projectDir, space)) ?? "legacy";
   return `${space}/${intentUuid}/${unit}`;
 }
 
@@ -26441,6 +26446,7 @@ export function clearUnitScopeStamp(projectDir: string): void {
 function applicableTeamUnitScopeStamp(
   projectDir: string,
   stateContent?: string,
+  selection?: WorkflowSelection,
 ): UnitScopeStamp | null {
   let state = stateContent;
   try {
@@ -26451,8 +26457,8 @@ function applicableTeamUnitScopeStamp(
   if (!isTeamUnitOwnership(state)) return null;
   const stamp = readUnitScopeStamp(projectDir);
   if (!stamp) return null;
-  const space = activeSpace(projectDir);
-  const intentUuid = activeIntentUuid(projectDir, space);
+  const space = selection?.space ?? activeSpace(projectDir);
+  const intentUuid = selection ? intentUuidForSelection(projectDir, selection) : activeIntentUuid(projectDir, space);
   if (
     !intentUuid ||
     stamp.space !== space ||
@@ -26702,21 +26708,22 @@ export function eventMatchesClaimAttempt(
   projectDir: string,
   block: string,
   unit?: string,
+  selection?: WorkflowSelection,
 ): boolean {
   let state: string;
   try {
-    state = readStateFile(projectDir);
+    state = readStateFile(projectDir, selection?.intent ?? undefined, selection?.space);
   } catch {
     return true;
   }
   if (!isTeamUnitOwnership(state)) return true;
-  const stamp = applicableTeamUnitScopeStamp(projectDir, state);
+  const stamp = applicableTeamUnitScopeStamp(projectDir, state, selection);
   if (!stamp) {
     if (!unit) return true;
     const eventGeneration = auditBlockField(block, "Attempt Generation");
     if (eventGeneration === null) return true;
     const generation =
-      readClaimGenerations(projectDir)[claimGenerationKey(projectDir, unit)];
+      readClaimGenerations(projectDir)[claimGenerationKey(projectDir, unit, selection)];
     return generation === undefined
       ? true
       : eventGeneration === String(generation);
@@ -32291,8 +32298,9 @@ export function unitGateStatus(
   unit: string,
   scope: UnitGateScope,
   auditRows?: readonly AuditShardEvent[],
+  selection?: WorkflowSelection,
 ): UnitGateStatus {
-  const rows = auditRows ?? readAuditShardEvents(projectDir).sort((a, b) => {
+  const rows = auditRows ?? readAuditShardEvents(projectDir, selection?.intent ?? undefined, selection?.space).sort((a, b) => {
     if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
     if (a.shardIndex !== b.shardIndex) return a.shardIndex - b.shardIndex;
     return a.pos - b.pos;
@@ -32320,7 +32328,7 @@ export function unitGateStatus(
       }
       return (
         gateEventMatchesUnit(row.block, stage, unit) &&
-        eventMatchesClaimAttempt(projectDir, row.block, unit) &&
+        eventMatchesClaimAttempt(projectDir, row.block, unit, selection) &&
         (auditBlockField(row.block, "Gate Scope") ?? "per-stage") === scope
       );
     });
@@ -33325,8 +33333,9 @@ function currentUnitLifecycleRows(
   unitMajor: boolean,
   auditRows?: readonly AuditShardEvent[],
   stateContent?: string,
+  selection?: WorkflowSelection,
 ): UnitLifecycleRow[] {
-  const sourceRows = auditRows ?? readAuditShardEvents(projectDir);
+  const sourceRows = auditRows ?? readAuditShardEvents(projectDir, selection?.intent ?? undefined, selection?.space);
   const startedAt = auditRows
     ? sourceRows
         .filter(
@@ -33385,7 +33394,7 @@ function currentUnitLifecycleRows(
     if (auditBlockField(row.block, "Stage") !== slug) continue;
     const unit = auditBlockField(row.block, "Unit");
     if (!unit) continue;
-    if (!eventMatchesClaimAttempt(projectDir, row.block, unit)) continue;
+    if (!eventMatchesClaimAttempt(projectDir, row.block, unit, selection)) continue;
     if (auditBlockField(row.block, "Run floor") !== floorFor(unit)) continue;
     if (!unitMajor && cutoff && row.timestamp < cutoff) continue;
     rows.push({
@@ -33536,6 +33545,7 @@ export function unitLifecycleSnapshot(
   auditRows: readonly AuditShardEvent[],
   stateContent: string,
   options: {
+    selection?: WorkflowSelection;
     artifactFingerprint?: (
       stage: StageEntry,
       unit: string,
@@ -33553,6 +33563,7 @@ export function unitLifecycleSnapshot(
     unitMajor,
     auditRows,
     stateContent,
+    options.selection,
   );
   const stage = resolveStage(slug);
   const receipts = new Set<string>();
@@ -33584,6 +33595,8 @@ export function unitLifecycleSnapshot(
           ? options.artifactFingerprint(stage, row.unit)
           : reviewArtifactFingerprint(projectDir, stage, row.unit, {
               requireRequiredArtifacts: true,
+              selection: options.selection,
+              stateContent,
             });
     if (waveCompletionHolds(recorded, current, options.keepChangedWaveCompletions === true)) {
       receipts.add(row.unit);
@@ -35347,6 +35360,147 @@ export function unitMajorConstructionStageSlugs(
       ) === "EXECUTE";
     })
     .map((stage) => stage.slug);
+}
+
+
+// Scope-change and recompose may change the plan, but cannot discard a live
+// Unit attempt. Read the same lifecycle/gate ledgers as routing, under the
+// caller's intent lock. Unit Progress is a derived view, never an input here.
+// No cache refresh, receipt invalidation, migration, or audit write is allowed.
+export function unitPlanChangeRefusal(
+  projectDir: string,
+  before: string,
+  after: string,
+  selection: WorkflowSelection,
+): string | null {
+  const oldScope = getField(before, "Scope") ?? "";
+  const newScope = getField(after, "Scope") ?? "";
+  const oldBlock = unitMajorConstructionStageSlugs(oldScope, before, true);
+  const newBlock = unitMajorConstructionStageSlugs(newScope, after, true);
+  const losesDag = !usesStageLevelPerUnitArtifacts(oldScope, before) &&
+    usesStageLevelPerUnitArtifacts(newScope, after);
+  const gainsDag = usesStageLevelPerUnitArtifacts(oldScope, before) &&
+    !usesStageLevelPerUnitArtifacts(newScope, after);
+  const blockChanged = oldBlock.join("\n") !== newBlock.join("\n");
+  if (!losesDag && !gainsDag && !blockChanged) return null;
+
+  const unreadable: string[] = [];
+  const rows = readAuditShardEvents(
+    projectDir, selection.intent ?? undefined, selection.space, unreadable,
+  ).sort((a, b) => a.timestamp.localeCompare(b.timestamp) ||
+    a.shardIndex - b.shardIndex || a.pos - b.pos);
+  if (unreadable.length > 0) {
+    return "Cannot verify Unit work because the selected intent's audit history is unreadable. Repair it before changing the Unit plan.";
+  }
+  const dag = resolveBoltDag(projectDir, selection.intent ?? undefined, selection.space);
+  if (dag.state === "malformed") {
+    return `Cannot verify Unit work because the authoritative Unit DAG is ${dag.reason} (${dag.detail}). Repair it before changing the Unit plan.`;
+  }
+  const units = new Set(dag.state === "ok" ? dag.units : []);
+  // A gate still matters if its Unit was removed from the DAG by a hand edit.
+  for (const row of rows) {
+    const unit = auditBlockField(row.block, "Unit");
+    if (unit) units.add(unit);
+  }
+  const team = isTeamUnitOwnership(before);
+  const unitMajor = getField(before, "Construction Iteration")?.trim() === "unit-major" ||
+    getField(before, "Construction Checkpoints") === "enabled";
+  const checkboxes = new Map(parseCheckboxes(before).map((c) => [c.slug, c.state]));
+  const terminal = (slug: string): boolean =>
+    checkboxes.get(slug) === "completed" || checkboxes.get(slug) === "skipped";
+  const stamp = applicableTeamUnitScopeStamp(projectDir, before, selection);
+  const rhythm = stamp?.gate_rhythm ?? readUnitGateRhythm(before);
+  const unitEndDone = team && rhythm === "unit-end" &&
+    dag.state === "ok" && dag.units.length > 0 && oldBlock.length > 0 &&
+    dag.units.every((unit) => unitGateStatus(projectDir, oldBlock.at(-1)!, unit, rhythm, rows, selection) === "approved");
+  // Aggregate checkboxes can run ahead of per-Unit approvals. A unit-end block
+  // is settled only when every Unit's authoritative gate is approved.
+  const oldDone = team && rhythm === "unit-end" ? unitEndDone : oldBlock.every(terminal);
+  const contextChanges = losesDag || gainsDag;
+  let aggregateRefusal: string | null = null;
+
+  for (const stage of loadStageGraph().filter((s) => s.phase === "construction" && isPerUnitStage(s))) {
+    const dropped = effectivePlanAction(stage.slug, oldScope, before) === "EXECUTE" &&
+      effectivePlanAction(stage.slug, newScope, after) !== "EXECUTE";
+    const affected = dropped || (contextChanges && oldBlock.includes(stage.slug));
+    const lifecycle = currentUnitLifecycleRows(
+      projectDir, "", stage.slug, unitMajor, rows, before, selection,
+    );
+    const latest = new Map(lifecycle.map((row) => [row.unit, row]));
+    const snapshot = unitLifecycleSnapshot(projectDir, stage.slug, rows, before, { selection });
+    const aggregateState = checkboxes.get(stage.slug);
+    for (const unit of units) {
+      if (affected && team && rhythm === "per-stage" &&
+        UNIT_TERMINAL_EVENTS.has(latest.get(unit)?.event ?? "") &&
+        unitGateStatus(projectDir, stage.slug, unit, "per-stage", rows, selection) !== "approved") {
+        return `Unit "${unit}" settled ${stage.slug} work but its per-stage gate is not approved. Resolve the Unit gate before changing the plan.`;
+      }
+      for (const scope of ["per-stage", "unit-end"] as const) {
+        const gate = unitGateStatus(projectDir, stage.slug, unit, scope, rows, selection);
+        const unitEndBlockChanged = scope === "unit-end" && blockChanged;
+        const movesUnitEndApproval = unitEndBlockChanged &&
+          (!oldDone || newBlock.some((slug) => !oldBlock.includes(slug)));
+        if ((affected || unitEndBlockChanged) && (gate === "awaiting-approval" || gate === "revising")) {
+          return `Unit "${unit}" has ${gate} work at ${stage.slug} (${scope} gate). Keep Units Generation and that Unit's stage/gate plan until the work is resolved.`;
+        }
+        // A unit-end approval covers the old block. Never reuse it to approve
+        // a different block while Units are still walking it.
+        if (movesUnitEndApproval && gate === "approved") {
+          return `Unit "${unit}" already approved its unit-end gate at ${stage.slug}. Finish the current Unit block before changing its stages; adding work requires a new workflow attempt.`;
+        }
+      }
+    }
+    if (!affected) continue;
+    for (const row of latest.values()) {
+      if (!UNIT_TERMINAL_EVENTS.has(row.event) ||
+        (row.event === "UNIT_COMPLETED" && !snapshot.receipts.has(row.unit))) {
+        return `Unit "${row.unit}" has unfinished work at ${stage.slug} (${row.event}). Finish the Unit work first, or use the approved jump/recovery flow to start a new attempt.`;
+      }
+    }
+    // Ledger-free upgrades still route from artifact presence. A half-written
+    // Unit cannot vanish merely because it predates lifecycle receipts.
+    const legacyArtifacts = !snapshot.inUse && !terminal(stage.slug) &&
+      !usesStageLevelPerUnitArtifacts(oldScope, before) &&
+      (reviewArtifactEntries(projectDir, stage, undefined, {
+        selection, boltDag: dag, stateContent: before,
+      }) ?? []).some((entry) => entry.path !== null && isRegularFile(entry.path));
+    const progressed = legacyArtifacts || latest.size > 0 || [...units].some((unit) =>
+      unitGateStatus(projectDir, stage.slug, unit, "per-stage", rows, selection) !== "pending"
+    );
+    let settled = false;
+    if ((team || !terminal(stage.slug)) && progressed) {
+      // A partly completed stage still owns the remaining Units. Completed or
+      // conditionally skipped work may leave the plan once every Unit settles.
+      settled = dag.state === "ok" && dag.units.length > 0 && dag.units.every((unit) => {
+        const kind = dag.unitKinds?.get(unit) ?? null;
+        if ((stage.produces?.length ?? 0) > 0 &&
+          filterProducesByKind(stage.produces_kinds, stage.produces ?? [], kind).length === 0) return true;
+        if (team) {
+          const gateStage = rhythm === "unit-end" ? oldBlock.at(-1) : stage.slug;
+          return gateStage !== undefined &&
+            unitGateStatus(projectDir, gateStage, unit, rhythm, rows, selection) === "approved";
+        }
+        return UNIT_TERMINAL_EVENTS.has(latest.get(unit)?.event ?? "");
+      });
+      if (!settled) {
+        return `Stage "${stage.slug}" still has unfinished Unit work. Finish its Unit work and approvals before removing the stage or Units Generation.`;
+      }
+    }
+    if (!settled && (dag.state === "ok" || gainsDag) &&
+      (aggregateState === "awaiting-approval" ||
+        ((team || gainsDag) && (aggregateState === "in-progress" || aggregateState === "revising")))) {
+      aggregateRefusal ??= `Stage "${stage.slug}" still has Unit work (${aggregateState}). Resolve it before changing the Unit plan.`;
+    }
+  }
+  if (team && losesDag && newBlock.some((slug) => !terminal(slug))) {
+    return "Unit Ownership: team still has per-Unit Construction stages to run. Keep Units Generation until the Unit block is finished, or switch to solo ownership before any team Unit activity.";
+  }
+  const currentPhase = findStageBySlug(getField(before, "Current Stage") ?? "")?.phase;
+  if (gainsDag && dag.state !== "ok" && newBlock.some((slug) => !terminal(slug)) &&
+    (currentPhase === "construction" || currentPhase === "operation")) {
+    return "The new Unit plan needs a Unit DAG before Construction can continue. Use the approved jump/recovery flow to run Units Generation before changing this plan.";
+  }
+  return aggregateRefusal;
 }
 
 export function firstInScopeStageOfPhase(

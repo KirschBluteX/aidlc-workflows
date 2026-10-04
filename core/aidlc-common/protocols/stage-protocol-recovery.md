@@ -267,6 +267,17 @@ Generation.
 3. Re-plan execution from that point forward
 4. If the stage set changes, run `aidlc-utility.ts recompose` (or a scope change through `aidlc-orchestrate.ts next`); never edit scope configuration in `aidlc-state.md`
 
+A scope change or recompose is refused when it would remove Units Generation,
+discard unfinished Unit work or an unresolved Unit gate, or change a unit-end
+gate's stage set while Units still depend on that approval. Unit Progress is a
+derived view: the engine checks the current lifecycle and gate receipts, including
+Units ahead of the global stage cursor. Resolve the named Unit work and gates
+before retrying, or use the approved jump/recovery flow to begin a new attempt.
+Claimed Units and unfinished Unit merges must finish or be released before their
+Construction plan changes. A refusal leaves state and audit unchanged; it does
+not cancel work or manufacture an approval. Changes that retain the Unit plan
+(such as feature to MVP during Construction) can proceed.
+
 ### Archive before change
 Before any major change that would overwrite existing artifacts:
 1. Create `<record>/archive/` if it does not exist
