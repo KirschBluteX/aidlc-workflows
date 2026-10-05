@@ -144,7 +144,7 @@ function answers(f: Fixture, choice = "Approve Plan"): void {
 
 function receiptFiles(project: string): string[] {
   const dir = join(sessionsDir(project), "plan-approval");
-  return existsSync(dir) ? readdirSync(dir).filter((file) => /^receipt-.*\.json$/.test(file)) : [];
+  return existsSync(dir) ? readdirSync(dir).filter((file) => /^receipt-.*\.json$/.test(file)).sort() : [];
 }
 
 function approve(f: Fixture): void {
