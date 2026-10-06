@@ -10049,6 +10049,33 @@ function unitMajorRedo(
     `for unit "${unit}" again from the start. ${OTHER_UNITS_KEPT}`;
 }
 
+// A per-unit step a "redo <stage>" names, read from a solo unit-major walk:
+// whether it is the step the Unit in flight is on, and whether that Unit has
+// gone past it (unitMajorReopen's own reach for a jump back with no Unit
+// named). Null outside such a walk, or for a stage outside its steps.
+function unitWalkStepNamed(
+  projectDir: string,
+  scope: string,
+  stateContent: string,
+  currentSlug: string,
+  slug: string,
+): { live: boolean; past: boolean } | null {
+  if (!validScopes().has(scope)) return null;
+  const walk = unitMajorWalkBeat(projectDir, scope, stateContent, currentSlug);
+  if (!walk) return null;
+  const blockSlugs = walk.block.map((stage) => stage.slug);
+  const at = blockSlugs.indexOf(slug);
+  if (at === -1) return null;
+  const step = walk.step;
+  const liveStage = step.kind === "work" || step.kind === "summary"
+    ? step.stage.slug
+    : step.kind === "paused" ? step.stage : null;
+  return {
+    live: liveStage === slug,
+    past: liveStage === null ? step.kind === "checkpoint" : blockSlugs.indexOf(liveStage) > at,
+  };
+}
+
 // Whether the person's Redo on re-entry answered the re-use question for
 // this Unit's step (`jump reopen --via redo` records it). The answer is spent
 // once the Unit starts the step, and a later reopen or jump asks again. Rows are
@@ -12469,29 +12496,44 @@ function emitTypedResumeChoice(
   // to redo.
   if (choice === "redo" && named !== undefined) {
     const wanted = named.trim();
+    const node = nodeForSlug(wanted);
+    const forUnits = flags.unit !== undefined || flags.everyUnit;
     // Unit-by-Unit Construction keeps Current Stage on the block's first stage
     // while the Unit works through later ones: the step it is on is current too.
     const unitStage = getField(stateContent, "Unit Stage")?.trim();
-    if (wanted === slug) {
+    const walkStep = node !== undefined && isPerUnit(node)
+      ? unitWalkStepNamed(pd, scope, stateContent, slug, wanted)
+      : null;
+    const box = parseCheckboxes(stateContent).find((entry) => entry.slug === wanted)?.state;
+    if (!forUnits && walkStep?.past) {
+      // A step the Unit in flight already did, the block's first stage
+      // included, is reopened for that Unit, as the jump back to it does.
+      choice = "jump";
+    } else if (wanted === slug) {
       named = undefined;
       redoStage = slug;
-    } else if (unitStage !== undefined && wanted === unitStage && nodeForSlug(unitStage) !== undefined) {
+    } else if (
+      (unitStage !== undefined && wanted === unitStage && nodeForSlug(unitStage) !== undefined) || walkStep?.live
+    ) {
       named = undefined;
-      unitStep = unitStage;
-      redoStage = unitStage;
-    } else if ((flags.unit !== undefined || flags.everyUnit) && nodeForSlug(wanted) !== undefined) {
+      unitStep = wanted;
+      redoStage = wanted;
+    } else if (forUnits && node !== undefined && isPerUnit(node) && (walkStep !== null || box !== "pending")) {
       // A redo for named Units is reopening that step for them, and the reopen
       // judges what each Unit has run: a Unit can finish a step while the
-      // stage's own checkbox waits for the others.
+      // stage's own checkbox waits for the others. A stage that is not a
+      // per-unit step, or one no Unit can have reached, is judged as below.
       named = undefined;
       redoStage = wanted;
     }
-    else if (parseCheckboxes(stateContent).some((box) => box.slug === wanted && box.state === "completed")) choice = "jump";
+    else if (box === "completed") choice = "jump";
     else {
-      emit(errorDirective(
-        `${nodeForSlug(wanted) ? `"${wanted}" has not run yet, so there is nothing to redo` : `No stage is named "${wanted}"`}. ` +
-          "Tell the person, and ask whether they want to jump there or redo the current stage.",
-      ));
+      // Shown to the person as written: what happened, and what they can say.
+      const name = node?.name || wanted;
+      emit(errorDirective(node
+        ? `${name} has not run yet, so there is nothing to redo. ` +
+          `Say "jump to ${name}" to go there now, or "redo" to redo the step you are on.`
+        : `No stage is named "${wanted}". Say the stage again by its name, or "redo" to redo the step you are on.`));
       return;
     }
   }
@@ -12514,10 +12556,19 @@ function emitTypedResumeChoice(
     emit(errorDirective(unitProblem));
     return;
   }
+  // "... and stop there": the move is made, then the workflow is parked in
+  // place of the `next` that would carry on with it. --park says the person
+  // asked for that; without it, the conductor still reads their words for it.
+  const stopThere = `${flags.park === true
+    ? " The person also asked to stop there for now: make"
+    : " If the person also asked to stop there for now, make"} the move, following each print up to where it says ` +
+    `to re-run \`next\`, then run \`${aidlcToolInvocation("orchestrate")} park\` in place of that \`next\` and act on its \`parked\` directive.`;
+  const move = (directive: PrintDirective | ErrorDirective): PrintDirective | ErrorDirective =>
+    directive.kind === "print" ? printDirective(`${directive.message}${stopThere}`) : directive;
   if (choice === "resume") {
-    emit(printDirective(
+    emit(move(printDirective(
       `Resume choice accepted at "${slug}". Re-run \`next\` to continue from the last checkpoint.`,
-    ));
+    )));
     return;
   }
   // The Units the person named travel with the move, so it is their work that
@@ -12537,9 +12588,9 @@ function emitTypedResumeChoice(
       ));
       return;
     }
-    emit(printDirective(
+    emit(move(printDirective(
       `Redo accepted. Run \`next --stage ${shellArg(step)}${units}\`; it reopens that step for the Units named and says plainly if it cannot.`,
-    ));
+    )));
     return;
   }
   if (choice === "redo" && unitStep !== undefined) {
@@ -12548,15 +12599,15 @@ function emitTypedResumeChoice(
     // block's first stage. With nothing written for it yet, there is nothing to
     // throw away: doing it now starts it from the start.
     if (!validScopes().has(scope)) {
-      emit(redoCurrentStage(pd, scope, stateContent, slug));
+      emit(move(redoCurrentStage(pd, scope, stateContent, slug)));
       return;
     }
-    emit(printDirective(unitMajorRedo(pd, scope, stateContent, slug) ??
-      `Redo accepted at "${unitStep}": nothing is written for it yet, so it starts from the start. Re-run \`next\` and do "${unitStep}".`));
+    emit(move(printDirective(unitMajorRedo(pd, scope, stateContent, slug) ??
+      `Redo accepted at "${unitStep}": nothing is written for it yet, so it starts from the start. Re-run \`next\` and do "${unitStep}".`)));
     return;
   }
   if (choice === "redo") {
-    emit(redoCurrentStage(pd, scope, stateContent, slug));
+    emit(move(redoCurrentStage(pd, scope, stateContent, slug)));
     return;
   }
   if (choice === "jump") {
@@ -12569,20 +12620,18 @@ function emitTypedResumeChoice(
     }
     const node = nodeForSlug(target);
     if (node === undefined) {
-      emit(errorDirective(
-        `No stage is named "${target}". Report again with --target set to one of: ${loadGraph().map((stage) => stage.slug).join(", ")}.`,
-      ));
+      emit(errorDirective(`No stage is named "${target}". Say the stage again by its name.`));
       return;
     }
-    emit(printDirective(
+    emit(move(printDirective(
       `Jump accepted. Run \`next --stage ${node.slug}${units}\`; the direction and the target are worked out and checked for you.`,
-    ));
+    )));
     return;
   }
   if (choice === "fresh") {
-    emit(printDirective(
+    emit(move(printDirective(
       "Start-fresh accepted. When the person has said what the new work is (ask them if they have not), run `next --new-intent` with their description as one single-quoted argument, quoted the way the engine's own commands quote a person's words; the work in progress stays as it is, and the new work starts alongside it.",
-    ));
+    )));
     return;
   }
   emit(errorDirective(

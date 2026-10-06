@@ -461,7 +461,7 @@ describe("t118 differential corpus — engine vs aidlc-jump resolve (migrated fr
 
     const unknown = report("--choice", "jump", "--target", "no-such-stage", ...words("go to the moon"));
     expect(unknown.kind).toBe("error");
-    expect(unknown.message).toContain('No stage is named "no-such-stage"');
+    expect(unknown.message).toBe('No stage is named "no-such-stage". Say the stage again by its name.');
 
     // A fresh start carries none of the person's words: the new work starts the
     // way new work always does, with their description quoted shell-safe.
@@ -490,11 +490,50 @@ describe("t118 differential corpus — engine vs aidlc-jump resolve (migrated fr
     const redoThere = report("--choice", "redo", "--target", "market-research");
     expect(redoThere.kind).toBe("print");
     expect(redoThere.message).toContain("Run `next --stage market-research`");
-    for (const notRun of ["requirements-analysis", "build-and-test"]) {
+    // The error is shown to the person as written: it says what happened and
+    // what they can say, never an agent's instruction or a flag.
+    const forThePerson = (message: string) => {
+      for (const internal of ["Tell the person", "--target", "--choice", "Report again"]) {
+        expect(message).not.toContain(internal);
+      }
+    };
+    for (const [notRun, name] of [["requirements-analysis", "Requirements Analysis"], ["build-and-test", "Build and Test"]]) {
       const r = report("--choice", "redo", "--target", notRun);
       expect(r.kind).toBe("error");
-      expect(r.message).toContain(`"${notRun}" has not run yet, so there is nothing to redo`);
+      expect(r.message).toBe(
+        `${name} has not run yet, so there is nothing to redo. ` +
+          `Say "jump to ${name}" to go there now, or "redo" to redo the step you are on.`,
+      );
+      forThePerson(r.message);
+      // Asked for named Units or every Unit, a stage that is not a per-unit
+      // step and has not run is still not run: never a jump ahead to it.
+      for (const units of [["--every-unit"], ["--unit", "beta"]]) {
+        const forUnits = report("--choice", "redo", "--target", notRun, ...units);
+        expect(forUnits.kind, units.join(" ")).toBe("error");
+        expect(forUnits.message).toBe(r.message);
+      }
     }
+    const unknownRedo = report("--choice", "redo", "--target", "no-such-stage");
+    expect(unknownRedo.kind).toBe("error");
+    expect(unknownRedo.message).toBe(
+      'No stage is named "no-such-stage". Say the stage again by its name, or "redo" to redo the step you are on.',
+    );
+    forThePerson(unknownRedo.message);
+    forThePerson(unknown.message);
+    // Stage by stage, a per-unit step after the current one has run for no
+    // Unit: a redo of it for every Unit is not run either.
+    writeFileSync(
+      statePath(p),
+      before
+        .replace("- [S] functional-design", "- [-] functional-design")
+        .replace("- [-] code-generation", "- [ ] code-generation")
+        .replace(/^- \*\*Current Stage\*\*: .*$/m, "- **Current Stage**: functional-design"),
+      "utf-8",
+    );
+    const laterStep = report("--choice", "redo", "--target", "code-generation", "--every-unit");
+    expect(laterStep.kind).toBe("error");
+    expect(laterStep.message).toContain("Code Generation has not run yet, so there is nothing to redo.");
+    writeFileSync(statePath(p), before, "utf-8");
     // Unit by Unit, the step the Unit is on is the current one too.
     const unitMajor = readFileSync(statePath(p), "utf-8");
     writeFileSync(
@@ -611,6 +650,53 @@ describe("t118 differential corpus — engine vs aidlc-jump resolve (migrated fr
     expect(after).not.toContain("- [?] feasibility");
     expect(eventCount(p, "GATE_REJECTED")).toBe(0);
     expect(eventCount(p, "STAGE_REVISING")).toBe(0);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("SP4g: \"take me back to X and stop there\" makes the move, then parks instead of carrying on", () => {
+    const p = projWithState("state-jumped.md");
+    const report = (...extra: string[]) =>
+      directive(run(ORCHESTRATE, ["report", "--result", "resumed", ...extra, "--project-dir", p]));
+    const stopAsked = "The person also asked to stop there for now: make the move";
+    const parkInstead = " park` in place of that `next` and act on its `parked` directive.";
+    // Every move a re-entry request names keeps the stop the person asked for,
+    // and without --park the conductor still checks their words for one.
+    for (const extra of [
+      ["--choice", "jump", "--target", "market-research"],
+      ["--choice", "redo"],
+      ["--choice", "redo", "--target", "market-research"],
+      ["--choice", "redo", "--unit", "beta"],
+      ["--choice", "resume"],
+      ["--choice", "fresh"],
+    ]) {
+      const stopped = report(...extra, "--park");
+      expect(stopped.kind, extra.join(" ")).toBe("print");
+      expect(stopped.message, extra.join(" ")).toContain(stopAsked);
+      expect(stopped.message, extra.join(" ")).toContain(parkInstead);
+      // The engine's own park, which every tool runs without asking.
+      expect(stopped.message, extra.join(" ")).toMatch(/orchestrate(\.ts)? park` in place of that `next`/);
+      const plain = report(...extra);
+      expect(plain.message, extra.join(" ")).not.toContain(stopAsked);
+      expect(plain.message, extra.join(" ")).toContain("If the person also asked to stop there for now, make the move");
+      expect(plain.message, extra.join(" ")).toContain(parkInstead);
+    }
+    // An error or a question back to the person names no move to stop after.
+    expect(report("--choice", "jump", "--target", "no-such-stage", "--park").message).not.toContain("park`");
+    expect(report("--choice", "jump", "--park").message).not.toContain("park`");
+
+    // Followed through: the jump is made, the park lands on the stage jumped
+    // to, and nothing after it starts.
+    const asked = report("--choice", "jump", "--target", "market-research", "--park");
+    expect(asked.message).toContain("Run `next --stage market-research`");
+    const move = directive(run(ORCHESTRATE, ["next", "--stage", "market-research", "--project-dir", p]));
+    const command = /`[^`]*aidlc-jump\.ts (execute [^`]+)`/.exec(move.message)?.[1];
+    expect(command, move.message).toBeDefined();
+    const jumped = run(JUMP, [...(command as string).split(" "), "--project-dir", p]);
+    expect(jumped.status, jumped.out).toBe(0);
+    const parked = directive(run(ORCHESTRATE, ["park", "--project-dir", p]));
+    expect(parked.kind).toBe("parked");
+    const state = readFileSync(statePath(p), "utf-8");
+    expect(state).toMatch(/^- \*\*Current Stage\*\*: market-research$/m);
+    expect(state).toMatch(/^- \*\*Parked At Stage\*\*: market-research$/m);
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   // ============================================================
