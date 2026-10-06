@@ -159,6 +159,23 @@ are not asked about again. The flag rides along on rule-delivery `continue` call
 A covered grid without those receipts (a Build-and-Test loop-back over artifacts
 alone) is not marked, because that beat can still apply a fix.
 
+Under unit-major with Unit checkpoints off (the field disabled or absent), the
+per-Unit stage approvals still due once the whole grid is covered are one
+question. The first covered gate carries `approve_together`: the pending block
+stages from `directive.stage` on, in graph order, the Units, and the engine's
+question naming both. It is set only for solo work at the first pending block
+stage with at least two stages left; checkpoint-enabled, stage-major, team-owned
+and autonomous gates keep their own flow. Opening that gate records the list on
+`STAGE_AWAITING_APPROVAL` as `Approves Together`, and the reply's `next_stage` is
+the stage after the last listed one. `report --result approved` then approves
+each listed stage in order: the first `GATE_APPROVED` carries `Approves
+Together`, each later one `Approved Together With: <first stage>` plus the same
+`User Input` and person's words. Every stage still passes its own artifact,
+summary, reviewer and sensor checks; the first stage that refuses stops the run
+there, with the stages before it approved. That stage's later approval needs no
+new person turn while no reply, rejection or answer has been recorded since the
+approval that listed it. A rejection approves nothing.
+
 | Transition | Trigger | Emitter |
 |---|---|---|
 | `Pending → Active` | Engine routes after the previous reported outcome | `tools/aidlc-state.ts` (internal emitter) |

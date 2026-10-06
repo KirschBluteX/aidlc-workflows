@@ -145,6 +145,8 @@ import {
   type UnitCheckpoint,
   unitOpenCheckpoints,
   approvedConstructionUnits,
+  approvedTogetherFollowers,
+  approvesTogetherStages,
   attemptEventDefinitelyBefore,
   attemptEventIsCrossShardTied,
   artifactFilename,
@@ -287,6 +289,7 @@ import {
   reviewAttemptWindow,
   setField,
   withoutEntryWord,
+  isBareContinuationPhrase,
   sortAttemptEvents,
   resolveBoltDag,
   type BoltDagResolution,
@@ -872,6 +875,12 @@ function prepareEmission(directive: Directive): PreparedEmission {
   const switchOff = engineProjectDir ? switchOffNoticesOnce(engineProjectDir) : [];
   if (switchOff.length > 0) {
     directive = withChangeNotices(directive, [...switchOff, ...(directive.change_notices ?? [])]);
+  }
+  // The lines the reports of gates this `next` settled itself printed. A line
+  // said more than once (a report can add the hook health line this step
+  // already has) is said once.
+  if (settledNotices.length > 0) {
+    directive = withChangeNotices(directive, [...new Set([...(directive.change_notices ?? []), ...settledNotices])]);
   }
   if (activeStageValidityAdvisory) {
     directive = {
@@ -4562,6 +4571,8 @@ type SteeringTokenPayload = {
   e?: true;
   // Every Unit on the step was built in this attempt (build_settled).
   t?: true;
+  // The gate is one question for several stages (approve_together).
+  m?: true;
   h: string | null;
   // How the rules were cut into parts (steeringLayout). A part cut under one
   // limit is never continued with parts cut under another.
@@ -5991,6 +6002,7 @@ function markerSteeringPayload(
     )) ||
     (p.e !== undefined && p.e !== true) ||
     (p.t !== undefined && p.t !== true) ||
+    (p.m !== undefined && p.m !== true) ||
     (p.h !== null && typeof p.h !== "string") ||
     (p.l !== undefined && typeof p.l !== "string")
   ) {
@@ -6040,6 +6052,7 @@ function steeringTokenPayload(
       : undefined,
     e: directive.artifact_reuse ? true : undefined,
     t: directive.build_settled === true ? true : undefined,
+    m: directive.approve_together !== undefined ? true : undefined,
     h: route.stateHash,
     l: layout,
   };
@@ -6352,17 +6365,23 @@ function routingEvidenceFor(projectDir: string, stateContent: string | null): Co
 // bookkeeping gate itself (settleBookkeepingGate), and how many it settled.
 let routingArgs: string[] | null = null;
 let settledGates = 0;
+// The lines for the person the reports of those settled gates printed (a
+// change their Guard Policy accepted), said with the step this `next` hands
+// over (prepareEmission).
+let settledNotices: string[] = [];
 
 function handleNext(args: string[], projectDir: string | undefined): void {
   routingPassActive = true;
   routingArgs = args;
   settledGates = 0;
+  settledNotices = [];
   try {
     routeNext(args, projectDir);
   } finally {
     routingEvidence = null;
     routingPassActive = false;
     routingArgs = null;
+    settledNotices = [];
   }
 }
 
@@ -6488,6 +6507,9 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     // The settings typed with the request ride this answer as they ride the
     // option's command: the question it names fills them in below.
   }
+  // "carry on", "keep going" and the like, said on their own, name no new
+  // work: while work is in progress they get what no words get (see below).
+  const bareContinuation = routingAnswer === null && onlyProse && isBareContinuationPhrase(flags.intent ?? "");
 
   // An answer names its question by id. The copy is removed once the answer
   // starts work, so a missing copy may mean a repeated answer: carry on with
@@ -7149,7 +7171,8 @@ function routeNext(args: string[], projectDir: string | undefined): void {
       // or their own words): the work carries on, as `--resume` does, and
       // their words are read below. The Stop hook's probe still sees the park.
       const back = !isReadOnlyEngineProbe() && personSpokeSincePark(pd);
-      if (back && args.length === 0) {
+      // "carry on", "resume" and the like, said on their own, are no words.
+      if (back && (args.length === 0 || bareContinuation)) {
         emit(printDirective(
           `This workflow is parked. Run \`${aidlcToolInvocation("state")} unpark\` ` +
             "to clear the park marker, then re-run `next` to continue.",
@@ -7607,6 +7630,15 @@ function routeNext(args: string[], projectDir: string | undefined): void {
   //     COMPOSE OFFER, never a silent default. The conductor renders
   //     it; on "compose" it re-runs `next compose "<text>"` to reach the
   //     Branch 4c dispatch.
+  // A continuation phrase on its own where work is in progress but none is
+  // selected asks which work to pick up, as no words do.
+  if (!stateContent && bareContinuation) {
+    const pick = intentPickPromptIfRecordsExist(pd);
+    if (pick) {
+      emit(pick);
+      return;
+    }
+  }
   if (
     !stateContent &&
     flags.intent &&
@@ -7783,8 +7815,9 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     }
     // Words alone (nothing `next` reads as a flag, scope, verb or noun) may
     // ask to redo, jump to a stage, or start fresh, read the same way; words
-    // with a setting typed beside them are asked about with it, as below.
-    if (nextArgsAreOnlyWords(args)) {
+    // with a setting typed beside them are asked about with it, as below. A
+    // continuation phrase on its own asks none of these: it carries on below.
+    if (nextArgsAreOnlyWords(args) && !bareContinuation) {
       const words = saveQuestion(
         pd, flags.intent, "", "routing", { space: selection.space, targets: routingTargets() }, false, undefined,
         undefined, routingSettings(carriedRoutingFlags(flags)),
@@ -7793,6 +7826,10 @@ function routeNext(args: string[], projectDir: string | undefined): void {
       return;
     }
   }
+  // A continuation phrase on its own continues the work in progress: no
+  // routing question, the same step no words get. A question or gate the
+  // person has open read the words as its possible answer above.
+  if (bareContinuation) flags.intent = undefined;
   // A plan named by its word before the description (`/aidlc bugfix Fix login`)
   // is the scope that new work would get, asked about the same way.
   if (
@@ -9274,6 +9311,43 @@ function activePerUnitWave(
   return { state: "settled" };
 }
 
+// One late approval for the per-Unit stages still waiting once every Unit is
+// built (unit-major, Unit checkpoints off): the stages in order, the Units, and
+// the question the person answers, all from the engine. Undefined keeps the
+// ordinary one-stage gate. Every listed stage's work must be on disk.
+function approveTogetherFor(
+  projectDir: string,
+  stateContent: string | null,
+  node: GraphStage,
+  recordPrefix: string | null,
+  codekbCtx: CodekbCtx,
+): NonNullable<RunStageDirective["approve_together"]> | undefined {
+  const slugs = stateContent ? approvesTogetherStages(stateContent, node.slug) : null;
+  if (!slugs) return undefined;
+  const dag = resolveBoltBatches(projectDir, routingEvidenceFor(projectDir, stateContent));
+  if (dag.state !== "ok") return undefined;
+  const units = dag.batches.flat();
+  if (units.length === 0) return undefined;
+  const stages: { slug: string; name: string }[] = [];
+  for (const slug of slugs) {
+    const stage = nodeForSlug(slug);
+    if (!stage) return undefined;
+    const pick = nextUncoveredUnit(
+      projectDir, stage, units, recordPrefix, codekbCtx, dag.unitKinds ?? null, stateContent,
+      unitLedgerFor(projectDir, slug),
+    );
+    if (pick !== null) return undefined;
+    stages.push({ slug, name: stage.name });
+  }
+  const and = (names: string[]) =>
+    names.length <= 1 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return {
+    stages,
+    units,
+    prompt: `${and(stages.map((s) => s.name))} are complete for ${and(units)}. How would you like to proceed?`,
+  };
+}
+
 // Emit ONE iteration of a per-unit Construction stage. The engine owns the
 // for_each loop here: it resolves the next uncovered unit, substitutes the real
 // unit name for {unit-name} in every path, and suppresses the gate for EVERY
@@ -9455,6 +9529,9 @@ function emitPerUnitRunStage(
     if (built.length > 0 && built.every((u) => ledger.receipts.has(u))) {
       directive.build_settled = true;
     }
+    // Unit-major with checkpoints off: the stages still waiting are one question.
+    const together = approveTogetherFor(projectDir, stateContent, node, recordPrefix, codekbCtx);
+    if (together) directive.approve_together = together;
     if (stateContent !== null) {
       const preflight = preflightDirective(
         projectDir,
@@ -9552,6 +9629,7 @@ function settleBookkeepingGate(
         ));
       return true;
     }
+    settledNotices.push(...(reported?.change_notices ?? []));
   }
   settledGates++;
   routingEvidence = null;
@@ -10838,15 +10916,14 @@ function unitMajorForwardJump(
 // unit-major increment). code-generation's stage body still hard-stops at its
 // per-unit Plan Approval before generating, so a human sees each unit's
 // design -> plan -> code in sequence even though the stage-level gates come
-// later. The per-stage gates are UNCHANGED in count and machinery: they fire
-// late, in stage order, once the whole (stage x unit) grid is covered: the
-// fully-covered walk delegates to emitPerUnitRunStage for the CURRENT slug,
-// whose pick === null branch presents that stage's real gate on the last
-// unit. `handleApprove` then advances Current Stage to the next block stage;
-// its `next` re-enters here, finds the grid still fully covered, and presents
-// ITS gate, so the gates cascade at the block's end, one per human turn (the
-// presence guard enforces one resolution per turn). No gate/approve/audit
-// machinery changes.
+// later. The per-stage gates come due late, once the whole (stage x unit) grid
+// is covered: the fully-covered walk delegates to emitPerUnitRunStage for the
+// CURRENT slug, whose pick === null branch presents that stage's real gate on
+// the last unit. With Unit checkpoints off that gate carries approve_together:
+// one question for every block stage still waiting, and report approves them
+// in order from the person's one reply. Otherwise `handleApprove` advances
+// Current Stage to the next block stage and its `next` presents ITS gate, one
+// per human turn (the presence guard enforces one resolution per turn).
 function emitUnitMajorRunStage(
   node: GraphStage,
   projectType: "brownfield" | "greenfield" | null,
@@ -12863,6 +12940,23 @@ function skipTargetRefusal(
         `continue with \`${entrySkillInvocation()}\` and do the step it shows.`;
 }
 
+// The list one late approval covers, for the gate being opened or shown again.
+function approvesTogetherArgs(pd: string, stateContent: string, node: GraphStage): string[] {
+  const together = approveTogetherFor(pd, stateContent, node, engineRelativeRecordDir(pd), codekbCtxFor(pd));
+  return together ? ["--approves-together", together.stages.map((s) => s.slug).join(",")] : [];
+}
+
+function approvesTogetherFromToolOutput(stdout: string): string[] {
+  try {
+    const parsed = JSON.parse(stdout.trim().split("\n").at(-1) ?? "") as { approves_together?: unknown };
+    return Array.isArray(parsed.approves_together)
+      ? parsed.approves_together.filter((s): s is string => typeof s === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function approveArgs(slug: string, flags: ReportFlags): string[] {
   const args = ["approve", slug];
   if (flags.userInput) args.push("--user-input", flags.userInput);
@@ -13800,6 +13894,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
           flags.userInput!,
         );
       }
+      if (!revalidatingOpenGate) subArgs.push(...approvesTogetherArgs(pd, stateContent, node));
     } else if (flags.result === "rejected") {
       if (
         stageCheckbox.state !== "in-progress" &&
@@ -13839,6 +13934,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
           flags.userInput!,
         );
       }
+      subArgs.push(...approvesTogetherArgs(pd, stateContent, node));
     }
 
     const preflight = preflightSequenceDirective(
@@ -13886,7 +13982,8 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     if (flags.result === "awaiting-approval" || flags.result === "revised") {
       leadsToSpeech.add(gateReply);
       if (gateReply.kind === "print") {
-        const next = nextInScopeStage(slug, scope, loadStateFileIfPresent(pd) ?? undefined);
+        const listed = approvesTogetherFromToolOutput(res.stdout);
+        const next = nextInScopeStage(listed.at(-1) ?? slug, scope, loadStateFileIfPresent(pd) ?? undefined);
         gateReply.next_stage = next ? next.name : null;
         // Where the stage's output is, said with the gate, so the person can
         // look even when no summary comes before the question. A stage that
@@ -14061,6 +14158,12 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     emit(preflight);
     return;
   }
+
+  // A gate backfilled here records the stage list its question named, when it
+  // named several, the same as one opened with awaiting-approval.
+  sequence
+    .find((step) => step[0] === "gate-start" && step.includes("--recovered"))
+    ?.push(...approvesTogetherArgs(pd, stateContent, node));
   const committed: string[] = [];
   const changeNotices: string[] = [];
   for (const subArgs of sequence) {
@@ -14088,11 +14191,61 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     return;
   }
 
+  // One approval for several stages: approve the rest its question named, in
+  // order. The first stage that is not ready stops the run there, the stages
+  // before it stay approved, and its own step says what to do.
+  const approvedTogether = [slug];
+  const approvedNames = [node.name];
+  const approvedLine = () => `Approved ${approvedNames.slice(0, -1).join(", ")} and ${approvedNames.at(-1)}.`;
+  const followers = flags.result === "approved" && committed.includes("approve")
+    ? approvedTogetherFollowers(pd, slug)
+    : [];
+  for (const follower of followers) {
+    const live = loadStateFileIfPresent(pd);
+    const followerNode = nodeForSlug(follower);
+    const boxState = live ? checkboxForSlug(live, follower)?.state : undefined;
+    if (
+      !live || !followerNode || getField(live, "Current Stage")?.trim() !== follower ||
+      (boxState !== "in-progress" && boxState !== "awaiting-approval")
+    ) break;
+    const said = () => approvedNames.length > 1 ? [approvedLine()] : [];
+    const evidence = checkStageCompletionEvidence(followerNode, follower, scope, live, pd);
+    if (!evidence.ok) {
+      emit(withChangeNotices(errorDirective(evidence.message), [...changeNotices, ...said()]));
+      return;
+    }
+    const steps = boxState === "in-progress"
+      ? [["gate-start", follower], approveArgs(follower, flags)]
+      : [approveArgs(follower, flags)];
+    const followerPreflight = preflightSequenceDirective(pd, live, followerNode, steps);
+    if (followerPreflight !== null) {
+      emit(withChangeNotices(followerPreflight, [...changeNotices, ...said()]));
+      return;
+    }
+    for (const step of steps) {
+      const res = spawnState(pd, step);
+      if (res.exitCode !== 0) {
+        const detail = (res.stderr || res.stdout).trim();
+        const guardAsk = guardRecoveryAskFromToolOutput(detail);
+        emit(withChangeNotices(
+          guardAsk ?? stateRefusalDirective(`Could not complete "${follower}"`, `"${follower}"`, detail),
+          [...changeNotices, ...said()],
+        ));
+        return;
+      }
+      changeNotices.push(...changeNoticesFromToolOutput(res.stdout));
+    }
+    approvedTogether.push(follower);
+    approvedNames.push(followerNode.name);
+  }
+  if (approvedNames.length > 1) changeNotices.push(approvedLine());
+  const lastApproved = approvedTogether[approvedTogether.length - 1];
+
   // The transition committed. Emit a terminal `done` directive naming the move
   // — the loop driver reads this to know the report landed and the next `next`
   // will see fresh state. An approval that also asked to stop for now parks.
   const parked = stopForNow && workflowContinues(pd).workflow_continues
-    ? parkAfterApproval(pd, slug, !isAutonomousConstructionGate(stateContent, node, pd))
+    ? parkAfterApproval(pd, lastApproved, !isAutonomousConstructionGate(stateContent, node, pd))
     : null;
   if (parked) {
     emit(withChangeNotices(parked, changeNotices));
@@ -14103,7 +14256,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
       {
         kind: "done",
         reason:
-          `Committed ${committed.join(" + ")} for "${slug}" (scope: ${scope}). ` +
+          `Committed ${committed.join(" + ")} for "${approvedTogether.join('", "')}" (scope: ${scope}). ` +
           "State advanced; run next to continue.",
         ...workflowContinues(pd),
       },
@@ -14357,6 +14510,10 @@ function handleContinue(args: string[], projectDir: string | undefined): void {
   if (payload.q !== undefined) directive.unit_gate = payload.q;
   if (payload.o === true) applyGateOnlyShape(directive, pd, liveState ?? "");
   if (payload.t === true) directive.build_settled = true;
+  if (payload.m === true) {
+    const together = approveTogetherFor(pd, liveState, node, engineRelativeRecordDir(pd), codekbCtxFor(pd));
+    if (together) directive.approve_together = together;
+  }
   if (payload.j !== undefined && payload.u !== null && liveState !== null) {
     const unit = payload.u;
     applyConstructionCheckpointShape(

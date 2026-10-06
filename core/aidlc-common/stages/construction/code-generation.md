@@ -389,8 +389,9 @@ Include in the delegation prompt:
   The excluded appendix is never work to execute. With its fence on, the
   plan-approval guard refuses a handoff that quotes it. Do not read the
   plan file into the prompt yourself; the subagent ticks its progress in the
-  plan file, not in the prompt. When a build of this same approved plan was
-  interrupted, the output also carries a `## Progress before the interruption`
+  plan file, not in the prompt. When a build of this plan was interrupted and
+  the plan is unchanged since that build started, the output also carries a
+  `## Progress before the interruption`
   section after its two marker lines: the steps done (the ones the plan file
   ticks or, with none ticked, the ones whose named files changed since the build
   started), any file a done step names that is not in the project (the step may

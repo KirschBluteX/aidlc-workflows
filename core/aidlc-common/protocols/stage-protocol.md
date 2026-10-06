@@ -249,6 +249,20 @@ that reply carries no `next_stage`, use the run-stage directive's. When
 the next stage name from the phase, the plan, or your own expectations - only
 the engine's value is correct.
 
+**One question for several stage approvals.** When the gate's run-stage
+directive carries `approve_together`, the stages it lists (`approve_together.stages`,
+in order, the first being `directive.stage`) are all waiting for the person, and
+they answer them with ONE question. Show one completion message covering every
+listed stage, then the question above with `approve_together.prompt` as its
+`prompt`, and the same two options. Open and report the gate for
+`directive.stage` only, exactly once: an approval there approves every listed
+stage, and the engine says which. A change request is Request Changes for
+`directive.stage`; make the change in the listed stage it belongs to, through
+that stage's own revision steps, say in one line what changed, then show the
+same one question again. If the approval stops at a listed stage that is not
+ready yet, do what its reply names, then report that stage approved with the
+same choice: do not ask the person again.
+
 ### For stages with conditional options:
 IDEATION and INCEPTION stages may include a 3rd option to add a previously skipped stage:
 

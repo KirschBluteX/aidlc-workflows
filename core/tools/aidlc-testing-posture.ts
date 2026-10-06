@@ -1517,7 +1517,7 @@ export function workerBrief(
   const marker = target.unit
     ? `AIDLC-UNIT: ${target.unit}`
     : "AIDLC-STAGE: code-generation";
-  const resume = continuation ? null : codeGenerationResume(projectDir, target, { plan, approval });
+  const resume = codeGenerationResume(projectDir, target, { plan, content: snapshotFingerprint });
   const brief =
     `${marker}\n` +
     `AIDLC-TESTING-CONTRACT: ${contractHash}\n` +
@@ -1544,8 +1544,8 @@ export function workerBrief(
 // it the approved plan, where every step reads unticked. So a build cut off part
 // way (a provider error, the editor closed, a crash before the report) was run
 // again from step 1 by the next worker. When the brief is for a build that
-// already started under the approval that is current now, the plan file's ticks
-// are that build's progress, and the brief says so: which steps are ticked,
+// already started on the plan as it is now, the plan file's ticks are that
+// build's progress, and the brief says so: which steps are ticked,
 // which files they name are not in the project, and the step to continue at.
 // Whether a named file that is not there means the step must be redone is the
 // worker's call: a step can name a file it says not to add. The person hears
@@ -1555,13 +1555,17 @@ export function workerBrief(
 // files the steps name are the record: the furthest step whose named files all
 // changed since the build started is where the build got to.
 //
-// "Started under the approval that is current now" is the receipt the approval
-// check validates, at status `generation`. Its key binds the target, the stage
-// attempt (the run floor, which a Redo or a rejected gate moves) and the
-// fingerprint of the approved content (which an edit changes), and every new
-// approval writes a fresh receipt at status `approved`. So a new attempt, a
-// re-approval, and an edited plan (a lowered-fence continuation is not a current
-// approval) all start the steps fresh. And when a build starts fresh (generation
+// "Started on the plan as it is now" is the receipt the questions file names,
+// at status `generation`, when the plan and instructions on disk are the
+// content the build started on. Its key binds the target, the stage attempt
+// (the run floor, which a Redo or a rejected gate moves) and the fingerprint of
+// the approved content, and every new approval writes a fresh receipt at status
+// `approved`. The content a build starts on is the approved content, or, when a
+// lowered fence builds a plan edited after its approval, the edited content,
+// which generation start keeps on the receipt (`startedFingerprint`). So a new
+// attempt, a re-approval, and a plan edited after the build started all start
+// the steps fresh, and a build started on an edited plan picks up like any
+// other. And when a build starts fresh (generation
 // start moves a receipt from `approved` to `generation`), the engine clears the
 // plan file's ticks, so ticks left from before a Redo, a rejected gate, or a
 // re-approval never count as this build's progress. A resume finds the receipt
@@ -1673,13 +1677,14 @@ function stepHeadings(steps: PlanStep[]): string[] | null {
 
 /**
  * Where an interrupted build of this target stands, or null when there is
- * nothing to pick up: the build has not started under the current approval, the
- * active directive is a swarm batch, or nothing is ticked.
+ * nothing to pick up: the build has not started on the plan and instructions as
+ * they are now, the active directive is a swarm batch, or nothing is ticked.
+ * `content` is their fingerprint when the caller has already taken it.
  */
 export function codeGenerationResume(
   projectDir: string,
   target: CodeGenerationTarget,
-  known: { plan?: string; approval?: CodeGenerationApproval; issued?: CodeGenerationIssuance } = {},
+  known: { plan?: string; content?: string; issued?: CodeGenerationIssuance } = {},
 ): CodeGenerationResume | null {
   try {
     const state = readFileSync(stateFilePath(projectDir), "utf-8");
@@ -1695,9 +1700,12 @@ export function codeGenerationResume(
       ? readPlanApprovalReceipt(projectDir, { targetId: authority.targetId, runFloor: authority.runFloor, fingerprint })
       : null;
     if (receipt?.status !== "generation" || receipt.delegation !== undefined) return null;
-    const approval = known.approval ?? evaluateCodeGenerationApproval(projectDir, target, known.issued);
-    if (!approval.ok || approval.approvalFingerprint !== fingerprint) return null;
-    const steps = planSteps(known.plan ?? readFileSync(join(authority.stageDir, "code-generation-plan.md"), "utf-8"));
+    const plan = known.plan ?? readFileSync(join(authority.stageDir, "code-generation-plan.md"), "utf-8");
+    const content = known.content ?? buildContentFingerprint(
+      plan, readFileSync(join(authority.stageDir, "unit-test-instructions.md"), "utf-8"), authority,
+    );
+    if (content !== (receipt.startedFingerprint ?? fingerprint)) return null;
+    const steps = planSteps(plan);
     let ticked = steps.flatMap((step, index) => step.ticked ? [index + 1] : []);
     let next: number | null = steps.findIndex((step) => !step.ticked) + 1 || null;
     let from: CodeGenerationResume["from"] = "ticks";
@@ -1727,6 +1735,16 @@ export function codeGenerationResume(
   } catch {
     return null;
   }
+}
+
+/**
+ * The fingerprint of a plan and its test instructions over the testing contract
+ * the plan embeds: the content a build is on, approved or not. Null when either
+ * is empty or the plan embeds no contract.
+ */
+function buildContentFingerprint(plan: string, instructions: string, authority: CodeGenerationAuthority): string | null {
+  const contract = plan.trim().length > 0 ? parseTestingContract(plan)?.contract_sha256 : undefined;
+  return contract && instructions.trim().length > 0 ? approvalFingerprint(plan, instructions, contract, authority) : null;
 }
 
 /**
@@ -4604,19 +4622,27 @@ function publishCodeGenerationStart(
   prepared: ReturnType<typeof prepareCodeGenerationStart>,
   options: { recordContinuation?: boolean },
   originals: PlanApprovalRuntimeReceipt[],
+  pickUp: boolean,
 ): string[] {
   const { authority, receipt, continuation } = prepared;
   const changeNotices: string[] = continuation && options.recordContinuation !== false
     ? recordCodeGenerationContinuation(projectDir, continuation, "begin") : [];
   if (receipt.status === "generation") return changeNotices;
   originals.push(receipt);
+  // A lowered fence building a plan edited after its approval: the receipt
+  // keeps the content the build started on, so an interrupted build of it picks
+  // up (see "Picking up an interrupted build"). A swarm, a worktree delegation
+  // and a batch keep their own continuation rule.
+  const started = pickUp && continuation && !receipt.batch
+    ? buildContentFingerprint(continuation.artifacts.plan, continuation.artifacts.instructions, authority) : null;
+  const startedOn = started !== null && started !== receipt.fingerprint ? { startedFingerprint: started } : {};
   if (receipt.override !== undefined) {
     // A break-glass receipt is bound to content and attempt only. There is
     // no certified source to compare or re-certify, and no race window to
     // close, so the generation boundary is published as the receipt stands.
     // This is the one place an override could have been downgraded to
     // "approve again": it is not.
-    writePlanApprovalReceipt(projectDir, { ...receipt, status: "generation" });
+    writePlanApprovalReceipt(projectDir, { ...receipt, ...startedOn, status: "generation" });
     return changeNotices;
   }
   const stateBefore = workspaceSourceState(projectDir);
@@ -4629,6 +4655,7 @@ function publishCodeGenerationStart(
     // files as they are, said in one line.
     writePlanApprovalReceipt(projectDir, {
       ...receipt,
+      ...startedOn,
       certifiedSourceSha256: UNBINDABLE_FINGERPRINT,
       status: "generation",
     });
@@ -4663,6 +4690,7 @@ function publishCodeGenerationStart(
   // guard nor directive publication can retire this receipt mid-start.
   writePlanApprovalReceipt(projectDir, {
     ...receipt,
+    ...startedOn,
     certifiedSourceSha256: sourceBefore,
     status: "generation",
   });
@@ -4728,10 +4756,11 @@ export function beginCodeGenerationBatch(
           // own (see "Picking up an interrupted build"). They are cleared before
           // the start is published. A swarm batch and a worktree delegation keep
           // their own continuation rule.
-          if (started.receipt.status !== "generation" && started.receipt.delegation === undefined && !swarm) {
+          const pickUp = started.receipt.delegation === undefined && !swarm;
+          if (started.receipt.status !== "generation" && pickUp) {
             clearPlanFileTicks(projectDir, started.authority.stageDir);
           }
-          notices.push(...publishCodeGenerationStart(projectDir, started, options, originals));
+          notices.push(...publishCodeGenerationStart(projectDir, started, options, originals, pickUp));
         }
         if (needsSource && workspaceSourceFingerprint(projectDir) !== sourceBefore) {
           throw new Error("Source files changed while code generation was starting. Retry the step.");

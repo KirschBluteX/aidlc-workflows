@@ -143,7 +143,7 @@ function next(p: string, env: NodeJS.ProcessEnv = process.env) {
     construction_policy?: { offer_autonomy: boolean; completion_only: boolean; human_completion_required: boolean };
     artifact_reuse?: { decision: string; unit: string };
     ask_type?: string; narration?: string; plan_approval?: { status?: string; feedback?: string };
-    protocol_modules?: string[];
+    protocol_modules?: string[]; change_notices?: string[];
   };
 }
 
@@ -1664,15 +1664,22 @@ describe("t342 a unit-major recovery keeps every Unit's finished work", () => {
       if (!options.legacy) approve(p, unit);
     }
     for (const slug of stages.slice(0, stages.indexOf(through))) {
+      // With Unit checkpoints off one approval covers the late stage
+      // approvals, so a later stage may already be approved.
+      if (new RegExp(`^- \\[x\\] ${slug} `, "m").test(readFileSync(seededStateFile(p), "utf-8"))) continue;
       for (const result of ["awaiting-approval", "approved"]) {
         const report = tool(p, "orchestrate", [
           "report", "--stage", slug, "--result", result, "--user-input", "Approve",
         ]);
         expect(report.status, report.out).toBe(0);
-        expect(JSON.parse(report.stdout).kind, report.out).not.toBe("error");
+        if (!options.legacy) expect(JSON.parse(report.stdout).kind, report.out).not.toBe("error");
       }
     }
-    expect(readFileSync(seededStateFile(p), "utf-8")).toContain(`- **Current Stage**: ${through}`);
+    const state = readFileSync(seededStateFile(p), "utf-8");
+    for (const slug of stages.slice(0, stages.indexOf(through))) {
+      expect(state).toMatch(new RegExp(`^- \\[x\\] ${slug} `, "m"));
+    }
+    if (!options.legacy) expect(state).toContain(`- **Current Stage**: ${through}`);
     return p;
   }
 
@@ -2612,6 +2619,31 @@ describe("t342 a unit-major recovery keeps every Unit's finished work", () => {
       expect(next(p).construction_checkpoint?.unit).toBe("beta");
       expect(approved(p, "alpha")).toBe(true);
       expect(acceptedFor(p, "alpha")).toHaveLength(1);
+    }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+  }
+
+  // Both Units approved, then approved alpha's code changes (a revert, a hand
+  // edit). The one `next` that records the stage gates left still says the
+  // change to the person, once, with the step it hands over. Every change
+  // those gates recorded is said once: this fixture never started Code
+  // Generation through the engine, so its missing stage start is one too.
+  for (const policy of ["off (from scope classic)", "relaxed (set by you)"]) {
+    test(`Guard Policy ${policy.split(" ")[0]}: a change to an approved Unit's code is said once when one next records the stage gates`, () => {
+      const p = policyFixture("classic", policy);
+      for (const unit of ["alpha", "beta"]) {
+        buildReviewed(p, unit);
+        approve(p, unit);
+      }
+      writeFileSync(join(p, "src", "alpha.ts"), "export const alpha = 2;\n");
+      const recorded = () => readAuditShardEvents(p).filter((row) => row.event === "CHANGE_ACCEPTED").length;
+      const before = recorded();
+      const step = next(p);
+      const said = step.change_notices ?? [];
+      expect(step.construction_policy?.completion_only, JSON.stringify(step).slice(0, 400)).not.toBe(true);
+      expect(said.filter((line) => line === ALPHA_EDIT_LINE), JSON.stringify(said)).toHaveLength(1);
+      expect(acceptedFor(p, "alpha")).toHaveLength(1);
+      expect(said, JSON.stringify(said)).toHaveLength(recorded() - before);
+      expect(approved(p, "alpha")).toBe(true);
     }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
   }
 
