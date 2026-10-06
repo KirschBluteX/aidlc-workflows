@@ -37,7 +37,10 @@ the team `unit_gate` and settled-swarm policies when those fields are present.
    `rereview` re-checks the Unit's changed code or documents first, as
    described there.
 4. **`directive.construction_policy.completion_only === true`** closes the stage
-   after its Units were approved. It must also carry
+   after its Units were approved. In a solo unit-major walk a bare `next`
+   records these gates itself once the last Unit is approved and returns the
+   next real step, so this directive comes only where it cannot (a change
+   notice to say, team-owned Units, a swarm's settle). It must also carry
    `human_completion_required: false`. Skip the body, questions, reviewer, and
    learnings prompt, and say nothing about this step. Report
    `awaiting-approval`, then `approved`, for the emitted `directive.stage`,
@@ -156,11 +159,12 @@ Before presenting the command, write it as UTF-8 text to
 `<record>/verification-command.txt` using the harness's file-write tool
 (Write/edit), never a shell `echo` or heredoc. Repo-derived command text must
 never be interpolated into a shell line: shell substitutions could execute
-before the human approves. Pass only the record-relative file path below and
-use the invoking SessionStart session ID:
+before the human approves. Pass only the record-relative file path below; the
+command finds the session it runs in by itself, so pass no session and never
+look one up:
 
 ```bash
-{{INVOKE}} engine log decision --stage "<directive.stage>" --checkpoint verification-command --command-file verification-command.txt --session "<session ID>" --decision "Use this command to verify each completed Unit?" --options "Approve,Request Changes"
+{{INVOKE}} engine log decision --stage "<directive.stage>" --checkpoint verification-command --command-file verification-command.txt --decision "Use this command to verify each completed Unit?" --options "Approve,Request Changes"
 ```
 
 Render this structured question through the harness's question binding. Copy the
@@ -184,10 +188,10 @@ options:
 Read the person's reply in that session and record the choice they made. The
 human-turn hook keeps that they replied to this question and their exact words;
 a reply from another session, or to another question, does not count. When they
-approve, record their answer using the same session ID, and set the command:
+approve, record their answer, and set the command:
 
 ```bash
-{{INVOKE}} engine log answer --stage "<directive.stage>" --checkpoint verification-command --command-file verification-command.txt --session "<session ID>" --details "Approve"
+{{INVOKE}} engine log answer --stage "<directive.stage>" --checkpoint verification-command --command-file verification-command.txt --details "Approve"
 {{INVOKE}} engine state set-construction-verification-command --command-file verification-command.txt
 ```
 
@@ -271,10 +275,11 @@ to the checkpoint approval procedure when a human is required. Only after `verif
 reports `verified: true` and the current directive has `ready: true`, run `ask`.
 It refuses an unready or unverified checkpoint. Before presenting **Approve** /
 **Request Changes**, bind the question to the current checkpoint proof and
-authorized command digest in the invoking SessionStart session:
+authorized command digest. The command finds the session it runs in by itself,
+so pass no session and never look one up:
 
 ```bash
-{{INVOKE}} engine bolt checkpoint --action ask --unit "<unit>" --kind <unit|skeleton> --session "<session ID>"
+{{INVOKE}} engine bolt checkpoint --action ask --unit "<unit>" --kind <unit|skeleton>
 ```
 
 Then present the choices and wait for the human. Show the complete recorded
@@ -296,7 +301,7 @@ says <verdict>. Approve it?" ("code" in place of "design" when
 `rechecked.changed` is code). On a `NOT-READY` verdict, print the Review brief
 first, as the reviewer module asks after a recovery verdict:
 `bun {{HARNESS_DIR}}/tools/aidlc-review-brief.ts review --stage "<directive.stage>" --unit "<unit>" --why stale`.
-The human's reply in that session, to this checkpoint question, authorizes the
+The human's reply in this session, to this checkpoint question, authorizes the
 action you read from it: approve, or reject with what they asked to change
 (their words are kept with the record; add `--reason` when you want to say
 more). A reply from another session, or to a
@@ -311,17 +316,18 @@ question-and-answer flow.
 
 ```bash
 # Only after the human chose Approve:
-{{INVOKE}} engine bolt checkpoint --action approve --unit "<unit>" --kind <unit|skeleton> --session "<session ID>" --user-input 'Approve'
+{{INVOKE}} engine bolt checkpoint --action approve --unit "<unit>" --kind <unit|skeleton> --user-input 'Approve'
 # Automatic approval: verified ordinary Unit and human_required: false only.
 {{INVOKE}} engine bolt checkpoint --action approve --unit "<unit>" --kind unit
 # Only after the human chose Request Changes and supplied feedback:
-{{INVOKE}} engine bolt checkpoint --action reject --unit "<unit>" --kind <unit|skeleton> --session "<session ID>" --user-input 'Request Changes' --reason '<human feedback>'
+{{INVOKE}} engine bolt checkpoint --action reject --unit "<unit>" --kind <unit|skeleton> --user-input 'Request Changes' --reason '<human feedback>'
 ```
 
 After approval or rejection, re-run `next`. Never use a checkpoint approval as
 `report --stage code-generation --result approved` for the whole Unit set.
 Once all Unit approvals are recorded, the engine may emit normal stage gates
-with `completion_only: true`; settle those through the bookkeeping branch above.
+with `completion_only: true`; settle those through the bookkeeping branch above
+(in a solo unit-major walk a bare `next` records them itself).
 Explicit stage-major gated execution retains its ordinary stage reviews;
 autonomous execution skips their routine human completion questions.
 

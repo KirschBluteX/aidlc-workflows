@@ -51,6 +51,7 @@ import {
   stateDigest,
   workspaceSourceFingerprint,
   readActiveDirectiveMarker,
+  readPlanApprovalViolation,
   workspaceSourceState,
   writeSessionIntentUuid,
 } from "../../core/tools/aidlc-lib.ts";
@@ -67,6 +68,7 @@ import {
   DEFAULT_RECORD_DIR,
   DEFAULT_SPACE,
   intentsDirOf,
+  seedBoltDagBatches,
   seededAuditDir,
   seededRecordDir,
   seededStateFile,
@@ -185,6 +187,22 @@ function seedCodeGenerationDirective(dir: string, unit?: string): void {
   });
 }
 
+// A group of Units built at once: the swarm directive names them all.
+function seedSwarmDirective(dir: string, units: string[]): void {
+  const statePath = seededStateFile(dir);
+  const state = readFileSync(statePath, "utf-8").replace(
+    /^- \*\*Current Stage\*\*:.*$/m,
+    "- **Current Stage**: code-generation",
+  );
+  writeFileSync(statePath, state);
+  writeActiveDirectiveMarker(dir, {
+    kind: "invoke-swarm",
+    stage: "code-generation",
+    units,
+    state_sha256: stateDigest(state),
+  });
+}
+
 function initGitWorkspace(dir: string, options: { applicationSourceOnly?: boolean } = {}): void {
   mkdirSync(join(dir, "src"), { recursive: true });
   writeFileSync(join(dir, "src", "base.ts"), "export const base = true;\n");
@@ -208,11 +226,11 @@ function initGitWorkspace(dir: string, options: { applicationSourceOnly?: boolea
 
 function seedStageLevelPlanApproval(
   dir: string,
-  options: { bareSection?: boolean } = {},
+  options: { bareSection?: boolean; unit?: string } = {},
 ): string {
   const contract = resolveTestingPosture(dir);
-  const authority = resolveCodeGenerationAuthority(dir, { unit: null });
-  const record = codeGenerationRecordDir(dir, null);
+  const authority = resolveCodeGenerationAuthority(dir, { unit: options.unit ?? null });
+  const record = codeGenerationRecordDir(dir, options.unit ?? null);
   mkdirSync(record, { recursive: true });
   const plan = `# Plan\n\n${renderTestingContract(contract)}`;
   const instructions = "# Unit Test Instructions\n\nRun the focused test.\n";
@@ -3307,6 +3325,137 @@ describe("t218 Kiro IDE plan-approval enforcement", () => {
     }
   });
 
+  // Under a lowered Guard Policy an approved plan that changed since is still
+  // approved: the fallback for payloads with no arguments builds on, as the
+  // core guard does, and the build's own writes poison nothing. Strict asks.
+  test.each([["off", 0], ["strict", 2]] as const)("Guard Policy %s: an approved plan edited later, then an opaque call", (policy, code) => {
+    const dir = scratchProject(true);
+    try {
+      initGitWorkspace(dir);
+      seedCodeGenerationDirective(dir);
+      const choices = seedLegacyDirectiveChoices(dir);
+      expect(runIde(dir, "session-start", null).code).toBe(0);
+      const questions = seedStageLevelPlanApproval(dir);
+      const plan = join(seededRecordDir(dir), "construction", "code-generation", "code-generation-plan.md");
+      writeFileSync(plan, "# Plan\n\n## Steps\n\n- [ ] Implement\n", "utf-8");
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, plan)} file.`)).code).toBe(0);
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+      expect(runIde(dir, "record-human-turn", JSON.stringify({ prompt: choices.approve })).code).toBe(0);
+      writeFileSync(questions, readFileSync(questions, "utf-8").replace("[Answer]:", "[Answer]: Approve Plan"));
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+      expect(evaluateCodeGenerationApproval(dir, { unit: null }).ok).toBe(true);
+      if (policy === "off") {
+        const memory = join(dir, "aidlc", "spaces", "default", "memory");
+        mkdirSync(memory, { recursive: true });
+        writeFileSync(join(memory, "project.md"), "# Project\n\n## Guard Policy\n\nMode: off\n", "utf-8");
+      }
+      // The person edits the approved plan by hand.
+      writeFileSync(plan, `${readFileSync(plan, "utf-8")}\n- [ ] Add a log line\n`, "utf-8");
+      expect(evaluateCodeGenerationApproval(dir, { unit: null }).ok).toBe(false);
+      expect(runIde(dir, "plan-approval-guard", JSON.stringify({ toolName: "execute_bash", toolArgs: {} })).code).toBe(code);
+      if (policy === "off") {
+        writeFileSync(join(dir, "src", "legacy-generated.ts"), "export const generated = true;\n");
+        expect(runIde(dir, "audit-and-sensors", ctx("fs_write", "Created the src/legacy-generated.ts file.")).code).toBe(0);
+        expect(readPlanApprovalViolation(dir)).toBeNull();
+        expect(runIde(dir, "plan-approval-guard", JSON.stringify({ toolName: "fs_write", toolArgs: {} })).code).toBe(0);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // Source moving while the plan question waits: under a lowered Guard Policy
+  // the person's answer accepts that change, so the fallback never shows the
+  // plan again. It waits while the question is open, names the answer's own
+  // write once the person has replied, and their answer builds on. Strict
+  // re-presents the plan.
+  test.each(["off", "strict"] as const)("Guard Policy %s: source moves while the plan question waits", (policy) => {
+    const dir = scratchProject(true);
+    try {
+      initGitWorkspace(dir);
+      seedCodeGenerationDirective(dir);
+      const choices = seedLegacyDirectiveChoices(dir);
+      expect(runIde(dir, "session-start", null).code).toBe(0);
+      if (policy === "off") {
+        const memory = join(dir, "aidlc", "spaces", "default", "memory");
+        mkdirSync(memory, { recursive: true });
+        writeFileSync(join(memory, "project.md"), "# Project\n\n## Guard Policy\n\nMode: off\n", "utf-8");
+      }
+      const questions = seedStageLevelPlanApproval(dir);
+      const plan = join(seededRecordDir(dir), "construction", "code-generation", "code-generation-plan.md");
+      writeFileSync(plan, "# Plan\n\n## Steps\n\n- [ ] Implement\n", "utf-8");
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, plan)} file.`)).code).toBe(0);
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+      writeFileSync(join(dir, "src", "moved.ts"), "export const moved = true;\n");
+      const opaque = () => {
+        const r = runIde(dir, "plan-approval-guard", JSON.stringify({ toolName: "execute_bash", toolArgs: {} }));
+        return { code: r.code, said: `${r.stdout}${r.stderr}` };
+      };
+      const waiting = opaque();
+      expect(waiting.code).toBe(2);
+      if (policy === "strict") {
+        expect(waiting.said).toContain("Re-present the plan");
+        return;
+      }
+      expect(waiting.said).toContain("Plan Approval is awaiting a human response");
+      expect(waiting.said).not.toContain("Re-present the plan");
+      expect(runIde(dir, "record-human-turn", JSON.stringify({ prompt: choices.approve })).code).toBe(0);
+      const replied = opaque();
+      expect(replied.code).toBe(2);
+      expect(replied.said).toContain("owns fingerprint, decision, and answer recording");
+      expect(replied.said).not.toContain("awaiting a human response");
+      expect(replied.said).not.toContain("Re-present the plan");
+      writeFileSync(questions, readFileSync(questions, "utf-8").replace("[Answer]:", "[Answer]: Approve Plan"));
+      expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+      expect(evaluateCodeGenerationApproval(dir, { unit: null }).ok).toBe(true);
+      expect(opaque().code).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A call with no arguments may build any Unit of a group: under a lowered
+  // Guard Policy an approved Unit whose plan changed builds on only while every
+  // other Unit of the group is approved too. A Unit the person never approved
+  // keeps the call refused.
+  test.each([["approved too", 0], ["never approved", 2]] as const)(
+    "Guard Policy off, a group: one approved plan edited later, the other Unit %s",
+    (_other, code) => {
+      const dir = scratchProject(true);
+      try {
+        initGitWorkspace(dir);
+        const units = ["u1-store", "u2-tags"];
+        seedBoltDagBatches(dir, [units]);
+        seedSwarmDirective(dir, units);
+        expect(runIde(dir, "session-start", null).code).toBe(0);
+        const approve = (unit: string): string => {
+          const choices = seedLegacyDirectiveChoices(dir, {}, unit);
+          const questions = seedStageLevelPlanApproval(dir, { unit });
+          const plan = join(codeGenerationRecordDir(dir, unit), "code-generation-plan.md");
+          writeFileSync(plan, "# Plan\n\n## Steps\n\n- [ ] Implement\n", "utf-8");
+          expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, plan)} file.`)).code).toBe(0);
+          expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+          expect(runIde(dir, "record-human-turn", JSON.stringify({ prompt: choices.approve })).code).toBe(0);
+          writeFileSync(questions, readFileSync(questions, "utf-8").replace("[Answer]:", "[Answer]: Approve Plan"));
+          expect(runIde(dir, "audit-and-sensors", ctx("fs_write", `Created the ${relative(dir, questions)} file.`)).code).toBe(0);
+          expect(evaluateCodeGenerationApproval(dir, { unit }).ok).toBe(true);
+          return plan;
+        };
+        const plan = approve(units[0]);
+        if (code === 0) approve(units[1]);
+        const memory = join(dir, "aidlc", "spaces", "default", "memory");
+        mkdirSync(memory, { recursive: true });
+        writeFileSync(join(memory, "project.md"), "# Project\n\n## Guard Policy\n\nMode: off\n", "utf-8");
+        // The person edits the first Unit's approved plan by hand.
+        writeFileSync(plan, `${readFileSync(plan, "utf-8")}\n- [ ] Add a log line\n`, "utf-8");
+        expect(evaluateCodeGenerationApproval(dir, { unit: units[0] }).ok).toBe(false);
+        expect(runIde(dir, "plan-approval-guard", JSON.stringify({ toolName: "execute_bash", toolArgs: {} })).code).toBe(code);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("legacy file-tool mediation injects the contract and records a valid human approval", () => {
     const dir = scratchProject(true);
     try {
@@ -5734,8 +5883,8 @@ describe("t218 failed tool calls are not audited as writes (#417)", () => {
   });
 });
 
-describe("t218 enforce-approval-gate refusal names the reload steps", () => {
-  test("an open gate with no human turn blocks and says how to turn the hooks on", () => {
+describe("t218 enforce-approval-gate refusal names doctor's trust step", () => {
+  test("an open gate with no human turn blocks and names the step doctor names", () => {
     const dir = scratchProject(true);
     try {
       const statePath = seededStateFile(dir);
@@ -5750,20 +5899,167 @@ describe("t218 enforce-approval-gate refusal names the reload steps", () => {
       });
       expect(r.code, r.stderr).toBe(2);
       expect(r.stderr).toContain("An approval is waiting for the person's answer, so nothing runs until they give it: end the turn.");
+      expect(r.stderr).toContain("If they already answered, that answer was not recorded.");
+      // The same Kiro IDE step doctor names, from the same shipped text, so the
+      // two never send the person different ways; inside Kiro IDE (its hook
+      // processes carry VSCODE_IPC_HOOK/VSCODE_PID) the person gets that step
+      // alone, in fixed words the agent relays without explaining why.
+      const recovery = (JSON.parse(readFileSync(join(KIRO_IDE_TREE, "tools", "data", "harness.json"), "utf-8")) as {
+        hookActivation: { recovery: string };
+      }).hookActivation.recovery;
+      expect(recovery).toContain("choose Trust Folder & Continue when Kiro asks whether you trust it");
+      const ideStep = recovery.slice(0, recovery.indexOf(" In Kiro CLI,"));
+      expect(ideStep.startsWith("In Kiro IDE, trust this folder:")).toBe(true);
       expect(r.stderr).toContain(
-        "If they already answered, tell them to trust the folder if the Restricted Mode banner shows at the top of the window (select Manage, then Trust)",
+        `Tell them exactly this, with nothing about why: "Your answer was not recorded, so you don't need to answer again. ${ideStep}"`,
       );
-      expect(r.stderr).toContain('run "Developer: Reload Window" from the Command Palette');
-      expect(r.stderr).toContain(
-        "choose the aidlc agent in the chat panel's agent picker, so their next message is recorded; `/aidlc --doctor` shows anything else to fix.",
-      );
-      expect(r.stderr).toContain("In Kiro CLI, starting `kiro-cli` again in this folder does the same.");
-      // It says what to do, never how the hooks work, and never asks for the answer again.
+      // Trust takes effect after a window reload (measured), so the step names
+      // it; another agent in the picker does not stop the hooks, so it names no
+      // picker.
+      expect(r.stderr).toContain("Then run Developer: Reload Window from the Command Palette");
+      expect(r.stderr).not.toContain("agent picker");
+      // Only the Kiro IDE step reaches a Kiro IDE person: no other tool's
+      // line, and nothing about how AI-DLC works.
+      const words = r.stderr.slice(r.stderr.indexOf('"Your answer'), r.stderr.lastIndexOf('"') + 1);
+      for (const machinery of ["Kiro CLI", "kiro-cli", "ACP", "hook", "human turn", "recorded turn"]) {
+        expect(words).not.toContain(machinery);
+      }
+      expect(r.stderr).not.toContain("Kiro CLI");
+      expect(r.stderr).not.toContain("ACP");
       expect(r.stderr).not.toContain("hooks");
       expect(r.stderr).not.toContain("reply again");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // The same refusal outside Kiro IDE (Kiro CLI on this tree, or an ACP
+  // client: no VSCODE_IPC_HOOK/VSCODE_PID) names the other tools' lines, and
+  // leaves the Kiro IDE step out.
+  test("outside Kiro IDE the refusal gives the Kiro CLI and ACP lines, never the Kiro IDE step", () => {
+    const dir = scratchProject(true);
+    try {
+      const statePath = seededStateFile(dir);
+      writeFileSync(
+        statePath,
+        readFileSync(statePath, "utf-8").replace("- [-] requirements-analysis", "- [?] requirements-analysis"),
+      );
+      appendStageStarted(dir, "requirements-analysis", "2026-01-01T00:00:00Z");
+      const r = runIde(dir, "enforce-approval-gate", null, {
+        AIDLC_SKIP_HUMAN_PRESENCE_GUARD: "0",
+        VSCODE_IPC_HOOK: undefined,
+        VSCODE_PID: undefined,
+      });
+      expect(r.code, r.stderr).toBe(2);
+      expect(r.stderr).toContain(
+          'Tell them exactly this, with nothing about why, then only the line below for the tool they are in: "Your answer was not recorded, so you don\'t need to answer again."',
+      );
+      expect(r.stderr).toContain("In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder.");
+      expect(r.stderr).toContain(
+        "If you drive Kiro from an ACP client, the Kiro IDE guide names what that client must send.",
+      );
+      expect(r.stderr).not.toContain("In Kiro IDE, trust this folder");
+      expect(r.stderr).not.toContain("hooks");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The ACP sentence in the shared step names what to do, not AI-DLC's hooks.
+  test("the shared Kiro IDE step's ACP sentence says what to do, not how AI-DLC works", () => {
+    const activation = (JSON.parse(readFileSync(join(KIRO_IDE_TREE, "tools", "data", "harness.json"), "utf-8")) as {
+      hookActivation: { recovery: string };
+    }).hookActivation;
+    expect(activation.recovery).toContain(
+      "If you drive Kiro from an ACP client, the Kiro IDE guide names what that client must send.",
+    );
+    expect(activation.recovery).not.toContain("hooks");
+    // The adapter takes the Kiro IDE step as everything before this marker.
+    expect(activation.recovery.split(" In Kiro CLI,").length).toBe(2);
+  });
+
+  // The state tool's refusal for a reply that was not recorded says what
+  // happened, not to ask again, and the step doctor names for the tool the
+  // person is in, word for word, with nothing about how AI-DLC works. Inside
+  // Kiro IDE (VSCODE_IPC_HOOK or VSCODE_PID, the adapter's signal) that is its
+  // step alone; Kiro CLI and an ACP client, which nothing tells apart, get
+  // their own two lines and never Kiro IDE's.
+  test("the missed-reply line gives the person's own tool's step, not how AI-DLC works", () => {
+    const activation = (JSON.parse(readFileSync(join(KIRO_IDE_TREE, "tools", "data", "harness.json"), "utf-8")) as {
+      hookActivation: { recovery: string; missedReply: string; missedReplyInHost: { env: string[]; text: string } };
+    }).hookActivation;
+    const split = activation.recovery.indexOf(" In Kiro CLI,");
+    const ideStep = activation.recovery.slice(0, split);
+    const otherTools = activation.recovery.slice(split + 1);
+    const said = "Your answer was not recorded, so you don't need to answer again.";
+    const lead = "If the person already replied, that reply was not recorded. Do not ask them to answer again. ";
+    expect(activation.missedReplyInHost).toEqual({
+      env: ["VSCODE_IPC_HOOK", "VSCODE_PID"],
+      text: `${lead}Tell them exactly this, with nothing about why: "${said} ${ideStep}"`,
+    });
+    expect(activation.missedReply).toBe(
+      `${lead}Tell them exactly this, with nothing about why, then only the line below for the tool they are in: "${said}" ${otherTools}`,
+    );
+    expect(activation.missedReply).not.toContain("Reload Window");
+    expect(activation.missedReplyInHost.text).not.toContain("Kiro CLI");
+    expect(activation.missedReplyInHost.text).not.toContain("ACP");
+    for (const text of [activation.missedReply, activation.missedReplyInHost.text]) {
+      for (const machinery of ["hook", "human turn"]) expect(text).not.toContain(machinery);
+    }
+  });
+
+  // Measured on Kiro IDE: trusting the folder from the Restricted Mode banner
+  // runs no AI-DLC hook until Developer: Reload Window. Every copy of the trust
+  // step the person or the agent reads (doctor, the refusals, the skill, the
+  // guide) names the reload, so none leaves them with the hooks still off.
+  test("no copy of the Kiro IDE trust step leaves out the window reload", () => {
+    const stale = [
+      "you trust this folder, then say carry on",
+      "you trust this folder, then send a message",
+      "do not suggest reloading",
+      "on the Restricted Mode banner), then say carry on",
+      "then **Trust**. 2. Say carry on",
+      "says what it must send for AI-DLC's hooks to run",
+      "tell them that, and this: ",
+      "shows whether AI-DLC's hooks run in this window",
+    ];
+    const roots = [
+      KIRO_IDE_TREE,
+      join(REPO_ROOT, "dist-release", "kiro-ide", ".kiro"),
+      join(REPO_ROOT, "harness", "kiro-ide"),
+      join(REPO_ROOT, "docs", "guide"),
+    ].filter((root) => existsSync(root));
+    expect(roots).toContain(KIRO_IDE_TREE);
+    const hits: string[] = [];
+    for (const root of roots) {
+      for (const entry of readdirSync(root, { recursive: true }) as string[]) {
+        if (!/\.(md|ts|json|hook|txt)$/.test(entry)) continue;
+        let text: string;
+        try {
+          text = readFileSync(join(root, entry), "utf-8");
+        } catch {
+          continue;
+        }
+        const flat = text.replace(/\s+/g, " ");
+        for (const phrase of stale) {
+          if (flat.includes(phrase)) hits.push(`${relative(REPO_ROOT, join(root, entry))}: ${phrase}`);
+        }
+      }
+    }
+    expect(hits).toEqual([]);
+    const activation = (JSON.parse(readFileSync(join(KIRO_IDE_TREE, "tools", "data", "harness.json"), "utf-8")) as {
+      hookActivation: { recovery: string; notRunYet: string };
+    }).hookActivation;
+    for (const text of [activation.recovery, activation.notRunYet]) {
+      expect(text).toContain("Developer: Reload Window");
+      expect(text).toContain("select Manage on the Restricted Mode banner, then Trust");
+      expect(text).not.toContain("agent picker");
+    }
+    const skill = readFileSync(join(KIRO_IDE_TREE, "skills", "aidlc", "SKILL.md"), "utf-8");
+    expect(skill).toContain(
+      'Give the person this line and end your turn: "In Kiro IDE, trust this folder: choose Trust Folder & Continue',
+    );
+    expect(skill.replace(/\s+/g, " ")).toContain("Then run Developer: Reload Window from the Command Palette");
   });
 });
 

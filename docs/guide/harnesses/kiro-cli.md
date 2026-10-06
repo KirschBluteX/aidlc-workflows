@@ -57,7 +57,9 @@ Kiro from the project root:
 kiro-cli chat
 ```
 
-The native projection allows `aidlc engine *` engine commands. It also ships
+The native projection allows `aidlc engine *` engine commands and the exact
+read-only and turn-back-on commands (`aidlc doctor`, `aidlc config <section> --show --json`
+and the others listed under the session start below). It also ships
 `.kiro/settings/cli.json` with `chat.defaultAgent: "aidlc"`, so `/aidlc` is
 active without an agent flag. Run `/aidlc --doctor` in chat before the first
 workflow.
@@ -183,12 +185,18 @@ at that plain-text relay boundary; ordinary Unicode, paths, tabs, newlines, and
 literal escape-looking text remain unchanged.
 
 **Start the session from the project root.** Native installs pre-approve the
-installed `aidlc` command. Source/development copies pre-approve only
+installed `aidlc engine ...` commands and, exactly as written, the same
+read-only and turn-back-on commands listed next, run as `aidlc ...`.
+Source/development copies pre-approve only
 AI-DLC's own workflow commands, run project-relative: the engine commands
 (`bun .kiro/tools/aidlc.ts engine ...`), the read-only `doctor`, `version`,
-`--doctor`, `status`, `config <section> --show --json` and
-`config <section> --help`, and the AI-DLC tool scripts
-(`bun .kiro/tools/aidlc-<tool>.ts`). A `config` change, the commands that change
+`--version`, `--doctor` (doctor with or without `--verbose`), `status`,
+`--status`, `config --help`, `config --show` and
+`config <section> --show` with or without `--json`, and
+`config <section> --help`, turning a check back on with
+`config flags --clear-bypass <switch> --yes`, and the AI-DLC tool scripts
+(`bun .kiro/tools/aidlc-<tool>.ts`). Any other `config` change (turning a check
+off included), the commands that change
 the machine's AI-DLC install (`use`, `update`, `rollback`, `uninstall`,
 `system`) with the tool scripts behind them (`aidlc-doctor.ts`, `aidlc-init.ts`,
 `aidlc-lifecycle.ts`, `aidlc-machine-config.ts`), absolute paths,
@@ -246,7 +254,7 @@ CLI on its v3 engine, use the
 | Construction swarm | Parallel `Task` floor, optional ultracode Workflow | Subagent fan-out only; `AIDLC_USE_SWARM=1` is announced as a no-op |
 | Session audit events | `SESSION_STARTED/RESUMED/ENDED`, `SESSION_COMPACTED` | `SESSION_STARTED` only (Kiro has no session-end / pre-compaction hooks) |
 | Forwarding-loop enforcement (Stop hook) | Interactive + headless | Interactive sessions only — `--no-interactive` runs do not honor the stop-hook block |
-| Permissions | `settings.json` allowlist | Source-generated projection: AI-DLC's own project-relative workflow commands (engine, read-only dispatcher commands, AI-DLC tool scripts) and `date -u`; native and versioned release runtimes: `aidlc engine *`. Other shell commands prompt. |
+| Permissions | `settings.json` allowlist | Source-generated projection: AI-DLC's own project-relative workflow commands (engine, read-only dispatcher commands, AI-DLC tool scripts); native and versioned release runtimes: `aidlc engine *`. Other shell commands prompt. |
 | Welcome message | Rendered at session start from `settings.json` `companyAnnouncements` | None — Kiro has no welcome-render equivalent; the session-start hook injects resume context only |
 | MCP servers | Ships 5 (`.mcp.json`: `context7` + four AWS servers) | Ships the same 5 in `.kiro/settings/mcp.json`, all disabled by default; flip `"disabled": false` per server to enable it. Context7 is keyless on Kiro because Kiro sends configured HTTP header values verbatim instead of expanding environment placeholders. All 14 delegated personas opt in through `includeMcpJson: true` plus `@<server>` tool grants; the conductor gets none. |
 

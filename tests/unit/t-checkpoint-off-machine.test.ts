@@ -14,8 +14,9 @@ import {
   remainingOperationTimeoutMs,
 } from "../harness/test-budget.ts";
 import { afterEach, describe, expect, test, setDefaultTimeout } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   AIDLC_SRC, cleanupTestProject, createTestProject, resetAidlcEnv,
@@ -31,7 +32,14 @@ setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
 resetAidlcEnv();
 const projects: string[] = [];
+// Programs holding a project file open with no sharing (the Windows case at the end).
+const holders: ChildProcess[] = [];
+const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 afterEach(() => {
+  if (holders.length) {
+    while (holders.length) holders.pop()!.kill();
+    pause(1500);
+  }
   while (projects.length) cleanupTestProject(projects.pop());
 });
 const stages = ["functional-design", "nfr-requirements", "nfr-design", "infrastructure-design", "code-generation"];
@@ -141,7 +149,11 @@ function approve(p: string, unit: string): void {
   expect(checkpoint(["--action", "approve", "--session", session, "--user-input", "Approve"]).approved).toBe(true);
 }
 
-type Status = { approved: boolean; errors: string[]; rereview?: { stage: string; command: string } | null };
+type Status = {
+  approved: boolean;
+  errors: string[];
+  rereview?: { stage: string; reviewer: string; iteration: number; command: string } | null;
+};
 
 function checkpointStatus(p: string, unit: string): Status {
   const status = tool(p, "bolt", ["checkpoint", "--unit", unit, "--kind", "unit", "--action", "status"]);
@@ -159,7 +171,7 @@ function reviewThroughLog(p: string, args: string[]): string {
   mkdirSync(dirname(join(p, request.reviewFile)), { recursive: true });
   writeFileSync(join(p, request.reviewFile), `**Verdict:** READY\n**Reviewer:** ${REVIEWER}\n` +
     `**Iteration:** ${iteration}\n\n### Findings\n\nNo blocking findings.\n`);
-  const recorded = tool(p, "log", [...args, "--verdict", "READY"]);
+  const recorded = tool(p, "log", [...args.filter((arg) => arg !== "--retry-pending"), "--verdict", "READY"]);
   expect(recorded.status, recorded.out).toBe(0);
   return join(p, request.reviewFile);
 }
@@ -267,6 +279,34 @@ describe("t-checkpoint-off-machine: an approved Unit whose reviewed evidence can
     }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
   }
 
+  // Strict with the written reviews not on this machine (a teammate's clone):
+  // nothing here can check them, so each stage gets the one re-check, a fresh
+  // review, and then the person approves the Unit once. Never a refusal that
+  // nothing the person or the agent can do clears.
+  test("Guard Policy strict, the written reviews not on this machine: a fresh review of each stage, then alpha is approved again", () => {
+    const p = fixture(STRICT);
+    const reviews = build(p, "alpha");
+    approve(p, "alpha");
+    cases["review-record-absent"].act(p, reviews);
+    const rechecked: string[] = [];
+    for (let round = 0; round <= stages.length; round++) {
+      const status = checkpointStatus(p, "alpha");
+      if (!status.rereview) break;
+      rechecked.push(status.rereview.stage);
+      reviewThroughLog(p, [
+        "review", "--stage", status.rereview.stage, "--reviewer", status.rereview.reviewer,
+        "--unit", "alpha", "--iteration", String(status.rereview.iteration),
+        ...(status.rereview.command.includes("--retry-pending") ? ["--retry-pending"] : []),
+      ]);
+    }
+    expect(rechecked.length, "no re-check was offered").toBeGreaterThan(0);
+    const status = checkpointStatus(p, "alpha");
+    expect(status, JSON.stringify(status)).toMatchObject({ errors: [] });
+    approve(p, "alpha");
+    expect(checkpointStatus(p, "alpha").approved).toBe(true);
+    expect(readAuditShardEvents(p).filter((row) => row.event === "GATE_REJECTED")).toEqual([]);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
   // Strict holds a Unit whose code no longer matches what its review saw: the
   // code is re-checked once, then the person approves the Unit once, never
   // stuck at a checkpoint nothing can clear.
@@ -339,4 +379,39 @@ describe("t-checkpoint-off-machine: a review recorded while the source could not
     expect(status.approved, JSON.stringify(status)).toBe(false);
     expect(status.rereview?.stage, JSON.stringify(status)).toBe("code-generation");
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+});
+
+// On Windows another program (an editor, an indexer, a virus scanner) often
+// holds a file open with no sharing. AI-DLC still reads it there, so an
+// approved Unit stays approved under every Guard Policy. If a runtime upgrade
+// stops reading such a file, this fails before a person loses an approval.
+describe("t-checkpoint-off-machine: a file another program holds open on Windows", () => {
+  for (const policy of [STRICT, ...ACCEPTING]) {
+    test.skipIf(process.platform !== "win32")(`Guard Policy ${policy.split(" ")[0]}: alpha stays approved`, () => {
+      const p = fixture(policy);
+      build(p, "alpha");
+      approve(p, "alpha");
+      const target = join(p, "src", "alpha.ts");
+      // The helper's notes go outside the project, so they never join its source.
+      const notes = mkdtempSync(join(tmpdir(), "t-held-"));
+      const marker = join(notes, "taken.txt");
+      const q = (value: string) => `'${value.replaceAll("'", "''")}'`;
+      const script = `try { $f=[System.IO.File]::Open(${q(target)},'Open','Read','None'); ` +
+        `Set-Content -LiteralPath ${q(marker)} -Value 'held'; Start-Sleep -Seconds 300; $f.Close() } ` +
+        `catch { Set-Content -LiteralPath ${q(marker)} -Value ('error: ' + $_.Exception.Message) }`;
+      const out = openSync(join(notes, "out.txt"), "w");
+      holders.push(spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { stdio: ["ignore", out, out] }));
+      const until = Date.now() + 60_000;
+      while (!existsSync(marker)) {
+        if (Date.now() > until) {
+          throw new Error(`the helper never opened ${target}: ${readFileSync(join(notes, "out.txt"), "utf8").slice(0, 800)}`);
+        }
+        pause(200);
+      }
+      pause(300);
+      expect(readFileSync(marker, "utf8").trim()).toBe("held");
+      const status = checkpointStatus(p, "alpha");
+      expect(status, JSON.stringify(status)).toMatchObject({ approved: true, errors: [] });
+    }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+  }
 });

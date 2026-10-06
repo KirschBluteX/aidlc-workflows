@@ -511,6 +511,7 @@ Record the mode question and the user's mode choice through the log tool, the sa
 - After each batch of answers, IMMEDIATELY write the answers back to the questions file (update each `[Answer]:` tag)
 - Record each batch through the same log pair: `{{INVOKE}} engine log decision --stage <slug> --decision "<question numbers presented>" --options "<csv of the options shown>"` before the batch and `{{INVOKE}} engine log answer --stage <slug> --details '<the exact selections>'` after it. The tool stamps every row with its own fresh timestamp; there is no `date -u` call and no hand-written entry.
 - Continue until all questions are answered
+- When the `run-stage` directive carries `kept_replies`, the person already replied to these questions in a chat that ended before their answers were written down: do what its `note` says, recording each answer they gave before asking anything, and never ask them again what they already answered
 - **Consolidated summary before generation**: The checkpoint below applies only when `directive.ceremony.summary_confirmation === "on"`. When it is `"off"`, generate directly from the answers with no confirmation prompt, confirmation entry, or receipt. With it on, after all questions have been
   answered, present a consolidated summary of all answers as unordered bullets (never a numbered list). Then run
   `bun {{HARNESS_DIR}}/tools/aidlc-review-brief.ts summary --stage "<directive.stage>" --questions-file "<questions-path>"`;
@@ -823,9 +824,9 @@ Both levels MUST stay in sync. NO EXCEPTIONS. If a step is done, its checkbox is
 ### Generating ISO timestamps
 CLI tools (`aidlc-state.ts`, `aidlc-audit.ts`, `aidlc-jump.ts`) auto-generate fresh ISO timestamps for each call. The audit trail never needs a timestamp from you: every row is stamped by the tool or hook that appends it.
 
-When an artifact template asks for a UTC timestamp (a review file's `Date` field, for example), generate it via:
+When an artifact template asks for a UTC timestamp (a review file's `Date` field, for example), take it from the engine's clock and paste what it prints:
 ```bash
-date -u +"%Y-%m-%dT%H:%M:%SZ"
+{{INVOKE}} engine now
 ```
 NEVER use date-only format (e.g. `2026-02-17`). Always include the time component and Z suffix.
 

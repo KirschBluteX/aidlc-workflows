@@ -308,6 +308,25 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
     expect(missing).toEqual([]);
   });
 
+  // The person sees the stop note (Claude Code shows it as "Stop hook error"),
+  // so it carries only the next step; what the agent does with it lives here.
+  test("every shipped conductor SKILL says what to do when a stop note ends its turn", () => {
+    const clause = "**When your turn is stopped with a note.** A note that reads \"<step> is not finished yet. Next: <command>\" " +
+      "(or \"The last AI-DLC step stopped on a problem: ...\") is for you, and the person can already see it, so say nothing about it.";
+    const waiting = "If you had just asked the person a question in your own words and are waiting for their answer, record it with " +
+      "`{{INVOKE}} engine log decision --stage <stage> --decision \"<the question>\" --options \"<the choices>\"`";
+    const missing = skills.flatMap((rel) => {
+      const body = readFileSync(join(REPO_ROOT, rel), "utf-8");
+      return [
+        ...(body.includes(clause) ? [] : [`${rel}: clause`]),
+        ...(body.includes(waiting) ? [] : [`${rel}: waiting`]),
+        ...(body.includes("adding `--unit \"<directive.unit>\"` in team-owned Unit work") ? [] : [`${rel}: unit`]),
+        ...(body.includes("Never mark a stage done or approved just to end the turn.") ? [] : [`${rel}: never`]),
+      ];
+    });
+    expect(missing).toEqual([]);
+  });
+
   test("every SKILL and the onboarding switch a check when the person asks, with no typing for them", () => {
     // A live Claude chat followed the onboarding's old "name the exact command
     // for them to type" over the SKILL's rule and refused a plain request.
@@ -486,6 +505,25 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
     expect(failures).toEqual([]);
   });
 
+  // A live run showed a plan offer of about 200 lines (scores and a 33-row
+  // stage table) before the person could say "go ahead". The offer is short,
+  // and the tables come when asked.
+  test("the plan offer is short, with the stage table and scores on request", () => {
+    const short = "**Keep the offer short: a plain recommendation and the plan, with the details on request.**";
+    const missing = skills.flatMap((rel) => {
+      const body = readFileSync(join(REPO_ROOT, rel), "utf-8");
+      return [
+        ...(body.includes(short) ? [] : [`${rel}: short offer`]),
+        ...(body.includes("the scores and per-stage reasoning must be on screen before the user decides")
+          ? [`${rel}: tables before deciding`] : []),
+      ];
+    });
+    expect(missing).toEqual([]);
+    const orchestrate = readFileSync(join(REPO_ROOT, "core/tools/aidlc-orchestrate.ts"), "utf-8");
+    expect(orchestrate).not.toContain("Render the proposal to the human as THREE blocks");
+    expect(orchestrate).toContain("Render the proposal to the human as a SHORT offer");
+  });
+
   test("Codex conductor guidance uses its native $aidlc invocation", () => {
     const body = readFileSync(
       join(REPO_ROOT, "harness/codex/skills/aidlc/SKILL.md"),
@@ -551,6 +589,27 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
         "aidlc-common/protocols/stage-protocol-reviewer.md` says.",
         "Never review it in chat yourself, never write a review file by hand, never start the stage again with " +
           "`next --stage` to get one, and never offer to change the Guard Policy for it.",
+      ]) {
+        if (!body.includes(token)) missing.push(`${rel}  missing: ${token}`);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  // From live runs: at an open plan question, "from here on, build one unit at a
+  // time" was not carried out. The setters lived only in the Construction
+  // module, which an ask does not open: one agent said it already worked that
+  // way, the others went looking for the command.
+  test("every shipped conductor SKILL names the setters for a change to how Construction runs", () => {
+    const missing: string[] = [];
+    for (const rel of skills) {
+      const body = readFileSync(join(REPO_ROOT, rel), "utf-8").replace(/\s+/g, " ");
+      for (const token of [
+        "A change to how Construction runs is its setter:",
+        "`{{INVOKE}} engine state set-construction-iteration <unit-major|stage-major>`",
+        "`{{INVOKE}} engine state set-construction-checkpoints <enabled|disabled>`",
+        "`{{INVOKE}} engine state set-construction-execution <serial|swarm>`",
+        "say the setter's notice line and keep the gate open.",
       ]) {
         if (!body.includes(token)) missing.push(`${rel}  missing: ${token}`);
       }
@@ -865,11 +924,12 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
       }
 
       const ensemble = read(`${protocolRoot}/stage-protocol-ensemble.md`);
+      // The Kiro CLI subsection runs to the next heading; a shipped tree
+      // carries only its own tool's subsection, so that may be the end.
       const cliStart = ensemble.indexOf("### Kiro CLI\n");
-      const ideStart = ensemble.indexOf("### Kiro IDE\n", cliStart);
       expect(cliStart).toBeGreaterThan(-1);
-      expect(ideStart).toBeGreaterThan(cliStart);
-      const binding = ensemble.slice(cliStart, ideStart);
+      const next = ensemble.slice(cliStart + 1).search(/\n#{2,3} /);
+      const binding = ensemble.slice(cliStart, next === -1 ? undefined : cliStart + 1 + next);
       expect(binding, protocolRoot).toContain(citation);
       expect(binding, protocolRoot).toContain("native preload");
       expect(binding, protocolRoot).not.toMatch(residualPaste);
@@ -972,6 +1032,17 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
           missing.push(`${rel}  missing: ${token}`);
         }
       }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  test("every conductor SKILL shows the pick question and waits, even for one piece of work", () => {
+    // An agent that picks the only piece of work itself carries the person into
+    // work they never chose, and "not now" is lost.
+    const missing: string[] = [];
+    for (const rel of skills) {
+      const body = readFileSync(join(REPO_ROOT, rel), "utf-8");
+      if (!body.includes("show the question and wait for the person's answer, even when it lists one piece of work;")) missing.push(rel);
     }
     expect(missing).toEqual([]);
   });
@@ -1160,6 +1231,16 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
   // one, and the work's own files keep their paths.
   // The person's Plan Approval pick is matched on the choice labels, so they
   // stay exactly as given even when the rest of the question is translated.
+  // Kiro shows the presence floor's line to the person too, so it is one
+  // sentence for them, and every conductor keys its own step on it.
+  test("every conductor waits for the person on the approval floor's line", () => {
+    for (const rel of skills) {
+      expect(readFileSync(join(REPO_ROOT, rel), "utf-8"), rel).toContain(
+        'A refusal that reads "Nothing runs until you answer the approval question." means the person has not answered the approval question yet: show that question again if it is not on screen and end the turn; never run the call again before they reply.',
+      );
+    }
+  });
+
   test("every conductor keeps the Plan Approval choice labels exactly as given", () => {
     for (const rel of skills) {
       const body = readFileSync(join(REPO_ROOT, rel), "utf-8");
@@ -1469,6 +1550,13 @@ describe("t181 per-harness conductor-SKILL freshness gate (P11 RESOLVE-2)", () =
         /--description "<the new work>"/,
         /skip this probe and menu/i,
         /offers to resume or redo/i,
+        /offering a resume menu/i,
+        // The conductor reads the person's words; the engine routes only the
+        // typed choice.
+        /the engine routes their words/i,
+        // Status shows no receipt-less history either.
+        /Receipt-less histories are reported as untracked/i,
+        /the resume menu's/i,
       ]) {
         if (old.test(text)) stale.push(`${rel}  ${old.source}`);
       }

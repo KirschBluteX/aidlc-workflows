@@ -90,8 +90,13 @@ function guarded(
   args: string[],
   unattended = false,
   state = STATE,
+  host: NodeJS.ProcessEnv = {},
 ): { rc: number; out: string } {
   const env = { ...process.env };
+  // The host the agent's shell is in is the case's own, never the runner's.
+  delete env.VSCODE_IPC_HOOK;
+  delete env.VSCODE_PID;
+  Object.assign(env, host);
   env.AIDLC_SKIP_ARTIFACT_GUARD = "1";
   env.AIDLC_ALLOW_DIRECT_STATE_TRANSITIONS = "1";
   delete env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD;
@@ -275,9 +280,11 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
 
   // A refusal for a reply that was not recorded never asks the person to answer
   // again. Claude's tools (its shipped hookActivation) give the agent's own
-  // step and the one line to show; Kiro IDE's, whose only measured cause runs
-  // no command at all, point to doctor.
-  test("A2: Claude's refusal gives its own step, Kiro IDE's points to doctor, and neither asks again", () => {
+  // step and the one line to show; the Kiro IDE tree's give the words to relay
+  // with the step doctor names for the person's own tool: Kiro IDE's alone
+  // inside Kiro IDE, Kiro CLI's and an ACP client's elsewhere, and nothing
+  // about how AI-DLC works.
+  test("A2: Claude's refusal gives its own step, the Kiro IDE tree's gives the person's own tool's step, and neither asks again", () => {
     const slug = field(proj, "Current Stage"); // feasibility
     guarded(proj, ["checkbox", `${slug}=in-progress`]);
     guarded(proj, ["gate-start", slug]);
@@ -289,16 +296,32 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
     );
     expect(claude.out).not.toContain("reply again");
     expect(claude.out).not.toContain("Reload Window");
-    const r = guarded(proj, ["approve", slug, "--user-input", "Approve"], false, KIRO_IDE_STATE);
-    expect(r.rc).not.toBe(0);
-    const refusal = JSON.parse(r.out).error as string;
-    expect(refusal).toContain(
-      "If the person already replied, that reply was not recorded. Do not ask them to answer again.",
+    const refusalIn = (host: NodeJS.ProcessEnv): string => {
+      const r = guarded(proj, ["approve", slug, "--user-input", "Approve"], false, KIRO_IDE_STATE, host);
+      expect(r.rc).not.toBe(0);
+      const refusal = JSON.parse(r.out).error as string;
+      expect(refusal).toContain(
+        "If the person already replied, that reply was not recorded. Do not ask them to answer again.",
+      );
+      expect(refusal).not.toContain("hooks");
+      expect(refusal).not.toContain("agent picker");
+      expect(refusal).not.toContain("clientCapabilities");
+      return refusal;
+    };
+    const ideStep =
+      'Tell them exactly this, with nothing about why: "Your answer was not recorded, so you don\'t need to answer again. In Kiro IDE, trust this folder: choose Trust Folder & Continue when Kiro asks whether you trust it, or select Manage on the Restricted Mode banner, then Trust. Then run Developer: Reload Window from the Command Palette (Ctrl+Shift+P, or Cmd+Shift+P on macOS), and say carry on."';
+    for (const host of [{ VSCODE_IPC_HOOK: "/tmp/vscode-ipc.sock" }, { VSCODE_PID: "4242" }]) {
+      const inIde = refusalIn(host);
+      expect(inIde).toContain(ideStep);
+      expect(inIde).not.toContain("Kiro CLI");
+      expect(inIde).not.toContain("ACP");
+    }
+    // Kiro CLI v3 and an ACP client on this tree set neither.
+    const elsewhere = refusalIn({});
+    expect(elsewhere).toContain(
+      'Tell them exactly this, with nothing about why, then only the line below for the tool they are in: "Your answer was not recorded, so you don\'t need to answer again." In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder. If you drive Kiro from an ACP client, the Kiro IDE guide names what that client must send.',
     );
-    expect(refusal).toContain("`/aidlc --doctor` shows whether AI-DLC's hooks run in this window.");
-    expect(refusal).not.toContain("Reload Window");
-    expect(refusal).not.toContain("agent picker");
-    expect(refusal).not.toContain("clientCapabilities");
+    expect(elsewhere).not.toContain("Reload Window");
     expect(eventCount(proj, "GATE_APPROVED")).toBe(0);
     expect(field(proj, "Current Stage")).toBe(slug);
   });
@@ -318,7 +341,8 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
     expect(refusal).toContain('agent "aidlc" needs upgrading for this agent engine, using "default"');
     expect(refusal).toContain('"Type /agent and pick aidlc, then carry on."');
     expect(refusal).toContain(
-      '"Quit Kiro and start it again in this folder with: kiro-cli chat --agent-engine v2 --agent aidlc"',
+      '"Quit Kiro and start it again in this folder with: kiro-cli chat --agent-engine v2 --agent aidlc, ' +
+        'then type /aidlc to carry on."',
     );
     expect(refusal).not.toContain("reply again");
     expect(refusal).not.toContain("ACP");
@@ -1615,5 +1639,135 @@ describe("t188: human-presence approval gate (ledger-event design)", () => {
         "**Details**: Reject option B, use A",
       );
     });
+  });
+});
+
+// One message can approve and ask for more ("approve, and turn plan approval
+// off"), or say stop while the run approves on its own. The approval given in
+// that message, and the run's own approvals, leave the rest of it standing;
+// any other decision after it uses it up, and an approval or an answer still
+// needs a reply of its own.
+describe("t188: what the person's message asks for outlives the approval given in it", () => {
+  beforeEach(() => {
+    resetAidlcEnv();
+    proj = createTestProject();
+    seedStateFile(proj, MID_IDEATION); // Current Stage: feasibility
+  });
+
+  afterEach(() => cleanupTestProject(proj));
+
+  function setter(args: string[]): { rc: number; out: string } {
+    const env: NodeJS.ProcessEnv = { ...process.env, AIDLC_DISABLE_PLAN_APPROVAL_GUARD: "0" };
+    delete env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD;
+    delete env.AIDLC_UNATTENDED;
+    const r = spawnSync(BUN, [join(AIDLC_SRC, "tools", "aidlc-utility.ts"), ...args, "--project-dir", proj], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env,
+    });
+    return { rc: r.status ?? -1, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  }
+
+  function openGate(): string {
+    const slug = field(proj, "Current Stage");
+    guarded(proj, ["checkbox", `${slug}=in-progress`]);
+    guarded(proj, ["gate-start", slug]);
+    return slug;
+  }
+
+  const planApproval = () => /- \*\*Plan Approval\*\*: (\S+)/.exec(readFileSync(seededStateFile(proj), "utf-8"))?.[1];
+
+  test("approve, and turn plan approval off: both halves of the one message are carried out", () => {
+    const slug = openGate();
+    recordHumanTurn(proj);
+    const approved = guarded(proj, ["approve", slug, "--user-input", "Approve"]);
+    expect(approved.rc, approved.out).toBe(0);
+    const off = setter(["config-change", "--plan-approval", "off"]);
+    expect(off.rc, off.out).toBe(0);
+    expect(off.out).toContain("Each code plan is now built without asking.");
+    expect(planApproval()).toBe("off");
+  });
+
+  test("approve the plan, and turn plan approval off: one plan answer for several Units counts once", () => {
+    recordHumanTurn(proj);
+    for (const unit of ["core", "extra"]) {
+      appendAuditEntry("PLAN_APPROVAL_RECORDED", { Stage: "code-generation", Details: "Approve Plan", "Asked By": "engine", Unit: unit }, proj);
+    }
+    const off = setter(["config-change", "--plan-approval", "off"]);
+    expect(off.rc, off.out).toBe(0);
+    expect(planApproval()).toBe("off");
+  });
+
+  test("the same request after an approval from an earlier message waits for the person to say it again", () => {
+    const slug = openGate();
+    recordHumanTurn(proj);
+    expect(guarded(proj, ["approve", slug, "--user-input", "Approve"]).rc).toBe(0);
+    // Their next message answered a question: it is spent, and the approval was not from it.
+    const next = field(proj, "Current Stage");
+    expect(guardedLog(proj, ["decision", "--stage", next, "--decision", "Which name?", "--options", "A,B"]).rc).toBe(0);
+    recordHumanTurn(proj);
+    expect(guardedLog(proj, ["answer", "--stage", next, "--details", "A"]).rc).toBe(0);
+    const refused = setter(["config-change", "--plan-approval", "off"]);
+    expect(refused.rc).not.toBe(0);
+    expect(refused.out).toContain("No reply from the person has arrived since the last decision");
+    expect(planApproval()).not.toBe("off");
+    // The step the refusal names: they ask, and the setter runs.
+    recordHumanTurn(proj);
+    const off = setter(["config-change", "--plan-approval", "off"]);
+    expect(off.rc, off.out).toBe(0);
+  });
+
+  test("an approval after a message that was only a command to AIDLC came from the reply before it, so the command carries nothing more", () => {
+    const slug = openGate();
+    recordHumanTurn(proj);
+    appendAuditEntry("HUMAN_TURN", { Reply: "command" }, proj);
+    expect(guarded(proj, ["approve", slug, "--user-input", "Approve"]).rc).toBe(0);
+    const refused = setter(["config-change", "--plan-approval", "off"]);
+    expect(refused.rc).not.toBe(0);
+    expect(planApproval()).not.toBe("off");
+  });
+
+  test("the approval itself still needs a reply of its own: one message never approves two gates", () => {
+    const slug = openGate();
+    recordHumanTurn(proj);
+    expect(guarded(proj, ["approve", slug, "--user-input", "Approve"]).rc).toBe(0);
+    const second = openGate();
+    expect(second).not.toBe(slug);
+    expect(guarded(proj, ["approve", second, "--user-input", "Approve"]).rc).not.toBe(0);
+    expect(eventCount(proj, "GATE_APPROVED")).toBe(1);
+  });
+
+  test("a stop while the run approves on its own is theirs: the park goes through, and next says parked", () => {
+    setAutonomous(proj);
+    recordHumanTurn(proj);
+    const stage = field(proj, "Current Stage");
+    appendAuditEntry("GATE_APPROVED", { Stage: stage, Unit: "core", Checkpoint: "Construction Unit Approval", Autonomous: "true" }, proj);
+    appendAuditEntry("GATE_APPROVED", { Stage: stage }, proj);
+    const parked = guarded(proj, ["park"]);
+    expect(parked.rc, parked.out).toBe(0);
+    expect(readFileSync(seededStateFile(proj), "utf-8")).toContain("- **Parked By**: person");
+    const next = spawnSync(BUN, [ORCHESTRATE, "next", "--project-dir", proj], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+    });
+    expect(JSON.parse(next.stdout).kind, `${next.stdout}${next.stderr}`).toBe("parked");
+  });
+
+  test("a stop the autonomy grant or an answer used up waits for the person to say it again", () => {
+    setAutonomous(proj);
+    recordHumanTurn(proj);
+    appendAuditEntry("AUTONOMY_MODE_SET", { Mode: "autonomous" }, proj);
+    appendAuditEntry("GATE_APPROVED", { Stage: field(proj, "Current Stage"), Autonomous: "true" }, proj);
+    const granted = guarded(proj, ["park"]);
+    expect(granted.rc).not.toBe(0);
+    expect(granted.out).toContain("no reply from the person is on record");
+    recordHumanTurn(proj);
+    appendAuditEntry("QUESTION_ANSWERED", { Stage: field(proj, "Current Stage"), Details: "chosen by the agent" }, proj);
+    expect(guarded(proj, ["park"]).rc).not.toBe(0);
+    expect(readFileSync(seededStateFile(proj), "utf-8")).not.toContain("- **Parked**:");
+    // The step it names: when the person asks to stop, park then.
+    recordHumanTurn(proj);
+    const parked = guarded(proj, ["park"]);
+    expect(parked.rc, parked.out).toBe(0);
   });
 });

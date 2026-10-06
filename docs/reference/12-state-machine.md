@@ -260,7 +260,15 @@ fingerprinting, while the union drives receipt filtering.
 **Reviewer gate guard (issue #551).** A reviewer-bearing stage cannot enter
 `AwaitingApproval` through `gate-start` or `revise` until its configured
 reviewer has a fresh terminal `REVIEW_COMPLETED` receipt. The same receipt
-remains mandatory on all four completion paths. Re-reporting an already-open
+remains mandatory on all four completion paths, with one exception: the
+person's own approval (reported with their reply since the question) goes over
+a review that was requested in the current attempt and has no verdict yet, and
+`GATE_APPROVED` then carries `Review: not finished`. The gate a report backfills
+for that approval (`gate-start --recovered --person-approves`) opens the same
+way, only after such a reply. A review never requested, a recovery review in
+flight, a result that could not be verified, a review whose content changed
+after its verdict, and a project whose memory locks Guard Policy strict keep
+the review required. Re-reporting an already-open
 gate re-runs these guards without writing a duplicate transition. A rejection
 reported directly from `Active` moves to `Revising` without fabricating a
 `STAGE_AWAITING_APPROVAL` row. Synthetic transition tests that deliberately
@@ -493,7 +501,9 @@ the gate can reopen. Bypass with `AIDLC_SKIP_REVISION_BACKSTOP=1`.
 
 **Archive (issue #980).** `aidlc-utility intent archive <name> [--reason <text>]` retires an in-flight intent the team will not finish, or hides a completed one from the default listing. Under the workspace lock it emits `WORKFLOW_ARCHIVED` into that intent's own audit shard first, then flips the state file's `Status` to `Archived` (keeping the Status it replaced in `Archived From`) and the `intents.json` row to `archived`; the record dir, its artifacts, its audit shards, and any Bolt worktrees are never moved or deleted. A subsequent `next` on that record (a stale per-user cursor or session binding) emits a terminal `done` naming `intent unarchive`, so retired stages never resume by accident; `park` refuses an archived workflow the same way it refuses a completed one. Archiving is refused only for a team-owned intent with claimed Units. An intent with Bolt worktrees archives and the output names them; their `Bolt Refs` stay in the state file, Bolt start, complete, and merge refuse until unarchive, and doctor still counts them as active forks. `intent unarchive <name>` reverses the field writes, restoring `Completed` / `complete` when `Archived From` says `Completed` and `Running` / `in-flight` otherwise, and emits `WORKFLOW_UNARCHIVED`; a `--reason` given to it is not recorded, and the output says so. The default `intent` listing hides archived rows (`--all` shows them; `--json` always carries every row), the creation gate ignores them, and the lone-record fallback never resolves one implicitly.
 
-**Park (issue #365/#367).** `aidlc-orchestrate park` writes a `Parked` / `Parked At Stage` runtime marker (via `aidlc-state.ts park`, which emits `WORKFLOW_PARKED`) without advancing any stage; a subsequent plain `next` re-emits a terminal `parked` directive and the Stop hook lets the turn end, so a long workflow can pause across sessions instead of rubber-stamping the remaining stages to reach `done`. `/aidlc --resume` clears the marker (`unpark` emits `WORKFLOW_UNPARKED`) before continuing. An unattended autonomous Construction run (`Construction Autonomy Mode: autonomous`) refuses to park: both the tool and the Stop hook's `parked` allow decline under autonomous mode, so the loop keeps moving with no human to resume it. The one exception is a stop the person asks for. With a reply from them on record since the last decision, `park` (and an approval reported with `--park`) parks as attended (`parkWorkflow` in `aidlc-state.ts`) and records `Parked By: person`, which the Stop hook honors under autonomy too; `unpark` clears it. On a host whose hooks can miss a reply (its `hookActivation` names one), an attended session's park is recorded as the person's even with no reply on record, and its result carries a note saying so. `AIDLC_UNATTENDED=1` always refuses.
+**Park (issue #365/#367).** `aidlc-orchestrate park` writes a `Parked` / `Parked At Stage` runtime marker (via `aidlc-state.ts park`, which emits `WORKFLOW_PARKED`) without advancing any stage; a subsequent plain `next` re-emits a terminal `parked` directive and the Stop hook lets the turn end, so a long workflow can pause across sessions instead of rubber-stamping the remaining stages to reach `done`. `/aidlc --resume` clears the marker (`unpark` emits `WORKFLOW_UNPARKED`) before continuing. An unattended autonomous Construction run (`Construction Autonomy Mode: autonomous`) refuses to park: both the tool and the Stop hook's `parked` allow decline under autonomous mode, so the loop keeps moving with no human to resume it. The one exception is a stop the person asks for. With a reply from them on record since the last decision, `park` (and an approval reported with `--park`) parks as attended (`parkWorkflow` in `aidlc-state.ts`) and records `Parked By: person`, which the Stop hook honors under autonomy too; `unpark` clears it. The run's own approvals after their message do not use it up; any other decision does. On a host whose hooks can miss a reply (its `hookActivation` names one), an attended session's park is recorded as the person's even with no reply on record, and its result carries a note saying so. `AIDLC_UNATTENDED=1` always refuses.
+
+A park the person comes back to carries on. Once they have spoken after it (a `HUMAN_TURN` after the latest `WORKFLOW_PARKED`), a bare `next`, such as a bare `/aidlc` in the same chat, names the unpark and carries on instead of re-emitting `parked`, and words passed to `next` are read as on active work; the agent's own loop, whose stop came from the reply before the park, and the Stop hook's probe still get `parked`.
 
 ### Revision loop
 
@@ -746,14 +756,18 @@ Codex uses `$aidlc` instead of `/aidlc`, including in refusals.
 Both config and flags-first forms accept companion intent settings plus
 `--intent <name>` and `--space <name>`; omitted selectors use the hook payload
 session's workflow selection. Each selector is permitted at most once.
-A nonexistent named intent is refused; without a state file, create the piece
-of work and type the switch again.
+A nonexistent named intent is refused. Without a state file, two switches are
+kept for the piece of work this chat starts next: Guard Policy `relaxed` or
+`off` (alone, or as a flag of the new work's description), which a later
+`strict` withdraws, and plan approval `off` (`guard.plan-approval off` too),
+which a later `plan-approval on` withdraws. Any other fence switch says to
+create the piece of work and type it again.
 The hook checks memory-held strict, then uses the shared settings transaction
 with `typedByPerson: true` to append audit rows and write state under the audit
 lock, returning the result as `AIDLC Guard Policy: ...` hook context on harnesses
 that inject it.
-No switch is saved for later, and the CLI performs no switch-authority session
-lookup; hooks run on Windows too, so every harness that forwards the prompt
+Apart from those two grants for the next piece of work, no switch is saved for
+later, and the CLI performs no switch-authority session lookup; hooks run on Windows too, so every harness that forwards the prompt
 supports this path.
 
 After the memory-strict check, `config-change` and `scope-change` carry out an
@@ -1402,7 +1416,7 @@ the selected interaction:
 
 | `interaction` | Contract after selection |
 |---|---|
-| `command` | Execute the exact returned `command`, rendered from its structured `operation`. These operations (the resets, and `lower-fence`'s setter) require human selection; selection is sufficient to attempt the command. |
+| `command` | Execute the exact returned `command`, rendered from its structured `operation`. Every operation (the resets, `lower-fence`'s setter, `reopen-unit`, `review-advisory` and `record-unit-completion`) requires human selection, so its `requiresHuman` is true; selection is sufficient to attempt the command. |
 | `human-input` | Present the action's follow-up and end the turn. Request Changes needs a separate answer to "What should change?"; when it is the only remedy, a reply that does not pick it (and is not a dismissed question) is taken as that answer, so the person is not asked twice, and a later reply replaces it until the reject is submitted. A Scope remedy needs the human's concrete Scope. |
 | `external-work` | Perform the described work through its existing protocol and tools. Selection needs no additional feedback turn, but it does not prove that the work succeeded or supply missing arguments. |
 
@@ -1546,10 +1560,19 @@ valid re-confirmation can finish an unchanged pending review without another
 rejection or a new stage attempt.
 
 **One rule for first occurrence, at both sites.** A refusal renders as a
-guard-recovery `ask` the first time it happens. The router emits it as the
+guard-recovery `ask` the first time it happens. Its question is one line in the
+person's words, naming the stage (and the Unit) as they know it: "Functional
+Design for alpha can't go ahead as things stand: which way would you like to go
+on?", with "still" when the same state repeats; the options carry the detail
+and the reason codes stay in the ask's fields. The router emits it as the
 directive; an enforcing tool prints the human sentence and then the same ask as
 the last line of its refusal, which the router parses back into the directive it
-would have emitted itself. The `.aidlc-engine/guard-refusals/` record beside the other
+would have emitted itself. The review-freeze hook, whose output the tool shows
+the person, prints the human sentence and `Next:` with the `next` command
+instead, and leaves the ask in its refusal record: the next `next` asks it once,
+after any open gate or engine question, while the step is still open and
+unapproved, the same reset boundary holds, and the check would still refuse; a
+read-only probe reads it without taking it. The `.aidlc-engine/guard-refusals/` record beside the other
 gitignored runtime files counts repetitions of one guard state (stage, Unit,
 lifecycle state, attempt fields, the latest session/workflow/jump/rejection
 boundary, and the resource fingerprints); it carries no authority, and an
@@ -1563,7 +1586,7 @@ tool failure.
 
 **The human's selection survives the re-ask.** An engine-published guard-recovery
 ask is stored as an active-directive marker (`kind: "ask"`,
-`ask_type: "guard-recovery"`); a hook/tool-printed ask alone does not publish one.
+`ask_type: "guard-recovery"`); a tool-printed ask alone does not publish one, and neither does the review-freeze hook's ask when `next` asks it, so the person's own words from the request that led to the refusal still carry their Request Changes.
 The marker carries `remedies`, the offered `op`, `action`, `operation` (when present),
 and `interaction` entries in display order. The human-turn hook records that the
 person replied (`delivery: consumed`, `selection_sha256` over their words,

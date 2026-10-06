@@ -237,7 +237,10 @@ and files, never prose:
 
 - the stages that run and the ones skipped match the stage files' `scopes:` lists;
 - every decision recorded as the person's is backed by a turn the person script
-  sent (`tests/harness/person-turns.ts`);
+  sent (`tests/harness/person-turns.ts`); when one is not, the turn ledger and
+  each intent's audit trail and state are kept under
+  `unbacked-decisions-<id>/` in the test's log folder, so the order of events
+  survives the fixture's removal;
 - the scope file's switches show in state and directives;
 - the run ends done, with every output on disk.
 
@@ -669,12 +672,15 @@ is seen where it was introduced. The merge queue is different, because one
 flaky file drops the PR and rebuilds every group queued behind it. There,
 `ci.yml` passes `retry-once` to the smoke, unit and integration legs, which run
 the tier with `--file-retries 1`: a file whose first attempt failed assertions
-(failed cases, complete JUnit evidence, no timeout, no cleanup failure, at most
-ten minutes, and at least five minutes left in the run) runs once more in a
-fresh process and temporary directory. The rule lives in
+(failed cases, complete JUnit evidence, no file timeout, no cleanup failure, at
+most ten minutes, and at least five minutes left in the run) runs once more in a
+fresh process and temporary directory. A case that ran past its own case timeout
+is a failed case, and a file whose only failures are such case timeouts (a slow
+Windows runner timing out cases) may have run up to 45 minutes and
+still gets its one retry; `retries.json` marks it `caseTimeoutsOnly`. The rule lives in
 `tests/lib/file-retry.ts`, shared with the isolated live retry. A crash or
-nonzero exit without failed cases, a file that executed no cases, a timeout,
-and a second failure are never retried. Only a retry that passes every case the
+nonzero exit without failed cases, a file that executed no cases, a file that
+ran past its deadline, and a second failure are never retried. Only a retry that passes every case the
 first attempt ran replaces the first failure: a second failure, or a retry that
 skips one of those cases or executes none, stays a failure.
 The retry starts only after the first attempt's evidence is moved aside whole;
@@ -694,10 +700,14 @@ In the queue only, `ci.yml` passes `macos-merge-selection` to the macOS unit
 shards, and `scripts/ci-macos-unit-selection.ts` picks the unit files whose
 source names macOS or darwin (computed on each run, never a kept list) plus the
 unit files the change touches against its first parent (the queue entry ahead),
-spread over the twelve shards by weight, about 60 job-minutes in all. Each shard
-leaves the other files out with `--exclude`, so a file that skips on macOS stays
-`SKIP` as in a full shard; a shard with no selected file stops before installing.
-When the change cannot be diffed or the selection fails, the shard runs in full.
+spread over the twelve shards by weight, about 60 job-minutes in all. A selected
+file brings the rest of its affinity group (t249 reads the binary t238 builds).
+Each shard runs its share as one whole shard (`--shard 1/1`, so the shard rules
+such as required compiled coverage hold) and leaves the other files out with
+`--exclude`, so a file that skips on macOS stays `SKIP` as in a full shard; a
+shard with no selected file stops before installing. When the change cannot be
+diffed, a selected name falls outside the test-file grammar, or the selection
+fails, the shard runs in full.
 macOS smoke, integration, isolated E2E and the native-terminal units, Linux and
 Windows, PR CI and the nightly Full Suite run every file. `t345` pins this.
 

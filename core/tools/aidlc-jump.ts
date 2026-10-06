@@ -8,6 +8,7 @@ import { DEFAULT_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
 import { isCompiledExecutable } from "./aidlc-runtime-paths.ts";
 import { stageLabel } from "./aidlc-validity.ts";
 import {
+  addPendingPersonLines,
   type CheckboxState,
   countCheckboxes,
   emitError,
@@ -25,10 +26,12 @@ import {
   PHASES,
   parseCheckboxes,
   parseStateStageSuffixes,
+  readActiveDirectiveMarker,
   readStateFile,
   reviewArtifactEntries,
   resolveProjectDir,
   resolveStage,
+  resolveWorkflowSelection,
   type StageEntry,
   setCheckbox,
   removeField,
@@ -173,6 +176,17 @@ export function forwardJumpNotice(
   const list = names.length <= 1 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
   return `Moved to ${stageLabel(target, target.slug) ?? "that stage"}${list ? `; skipped ${list}` : ""}. ` +
     `To go back, type \`${entrySkillInvocation()} --stage ${cameFrom}\`.`;
+}
+
+// A backward jump says where it moved and how to return: the forward jump back
+// to the step the person was on. It rides the next step the agent speaks from,
+// because the backward instruction stays as the guard recovery knows it.
+export function backwardJumpNotice(
+  target: { slug: string; name: string; plugin?: string },
+  from: { slug: string; name: string; plugin?: string },
+): string {
+  return `Moved back to ${stageLabel(target, target.slug) ?? "that stage"}. ` +
+    `To return to ${stageLabel(from, from.slug) ?? "where you were"}, type \`${entrySkillInvocation()} --stage ${from.slug}\`.`;
 }
 
 if (import.meta.main) {
@@ -444,9 +458,13 @@ function handleExecute(args: string[]): void {
   // Get current stage for audit
   const currentSlug = getField(content, "Current Stage") || "state-init";
   // Where the person was: the active Unit's own step in a unit-at-a-time walk,
-  // which Current Stage does not name.
+  // which Current Stage does not name, or else the step the engine last put to
+  // them (a Unit's code plan, say) while it still matches this state.
   const unitStage = getField(content, "Unit Stage")?.trim() ?? "";
-  const cameFrom = graph.some((node) => node.slug === unitStage) ? unitStage : currentSlug;
+  const shownStage = readActiveDirectiveMarker(pd, content)?.stage?.trim() ?? "";
+  const cameFrom = graph.some((node) => node.slug === unitStage)
+    ? unitStage
+    : shownStage !== targetSlug && graph.some((node) => node.slug === shownStage) ? shownStage : currentSlug;
 
   // States that count as "in-flight" (skip on forward jump, reset on backward jump)
   const IN_FLIGHT_STATES: CheckboxState[] = [
@@ -683,9 +701,22 @@ function handleExecute(args: string[]): void {
 
   writeStateFile(pd, content);
 
+  // The jump is done, so the way back can never fail it. When no chat can
+  // hold the line for the next step, it rides the tool's output instead.
+  const from = graph.find((node) => node.slug === cameFrom);
+  let backNotice: string | undefined;
+  if (direction === "backward" && from) {
+    backNotice = backwardJumpNotice(targetStage, from);
+    try {
+      const session = resolveWorkflowSelection(pd).sessionId;
+      if (session && addPendingPersonLines(pd, session, [backNotice])) backNotice = undefined;
+    } catch {
+      // No chat to hold it: the output carries it.
+    }
+  }
   const notice = direction === "forward"
     ? forwardJumpNotice(targetStage, graph.filter((node) => stagesSkipped.includes(node.slug)), cameFrom)
-    : undefined;
+    : backNotice;
 
   console.log(
     JSON.stringify({

@@ -97,6 +97,9 @@ import {
   personCheckSwitchAllowed,
   personSpokeSinceGate,
   readActiveDirectiveMarker,
+  readAuditShardEvents,
+  REVIEW_RECORDS_DIR,
+  reviewerDispatchPath,
   spacesRoot,
   activeDirectiveOutOfDateReason,
   recordHookDrop,
@@ -825,6 +828,47 @@ function isRepliedPlanFileTarget(projectDir: string, target: string, editable: s
   }
 }
 
+// A review the person asked for while the plan waits writes only its open
+// request's own review file (the Review File of a REVIEW_REQUESTED with no
+// REVIEW_COMPLETED for its request id yet) and, while one is open, the reviewer
+// dispatch record beside it. Nothing is open when the trail cannot be read.
+function openReviewRequestFiles(projectDir: string): string[] {
+  try {
+    const record = docsRoot(projectDir);
+    const open = new Map<string, string>();
+    for (const row of readAuditShardEvents(projectDir)) {
+      const id = auditBlockField(row.block, "Request Id");
+      if (id === null) continue;
+      if (row.event === "REVIEW_COMPLETED") open.delete(id);
+      if (row.event !== "REVIEW_REQUESTED") continue;
+      // Audit rows are project text: only a slot inside the record's reviews
+      // folder, as `log review` writes it, counts.
+      const file = auditBlockField(row.block, "Review File");
+      const slot = file === null ? null : resolve(record, file);
+      const reviews = resolve(record, REVIEW_RECORDS_DIR);
+      if (slot !== null && !isAbsolute(file as string) && slot.startsWith(`${reviews}${sep}`)) open.set(id, slot);
+    }
+    return open.size === 0 ? [] : [...open.values(), resolve(reviewerDispatchPath(projectDir))];
+  } catch {
+    return [];
+  }
+}
+
+// One of those files exactly, reached through no symlink and not hard-linked
+// to another file.
+function isOpenReviewTarget(projectDir: string, target: string, files: string[]): boolean {
+  try {
+    const projectLexical = resolve(projectDir);
+    const targetAbs = resolve(target);
+    if (!files.some((file) => normalizeDriveLetter(file) === normalizeDriveLetter(targetAbs))) return false;
+    assertNoSymlinkInChainOrThrow(realpathSync(projectLexical), relative(projectLexical, targetAbs));
+    const existing = lstatSync(targetAbs, { throwIfNoEntry: false });
+    return existing === undefined || (existing.isFile() && existing.nlink === 1);
+  } catch {
+    return false;
+  }
+}
+
 // The composer's grid proposal (composerProposalPath) is engine scratch that
 // only validate-grid reads: not source, not a plan file, and nothing reads an
 // approval from it. A composition requested while Code Generation is current
@@ -910,6 +954,8 @@ function lastFlagValue(args: string[], flag: string): string | null {
 function isReadOnlyDiagnostic(args: readonly string[]): boolean {
   const [head = "", ...rest] = args;
   if (["status", "--status", "version", "--version", "help", "--help"].includes(head)) return true;
+  // The engine's clock, for a time a document asks for.
+  if (head === "engine" && rest.length === 1 && rest[0] === "now") return true;
   if (head !== "doctor" && head !== "--doctor") return false;
   return !rest.some((arg) =>
     arg === "--export" || arg === "--output" ||
@@ -1167,7 +1213,8 @@ function isNativePlanApprovalPrerequisite(
 // aidlc-utility.ts), which the unified entry point dispatches to.
 function isReadOnlyToolDiagnostic(stem: string, args: readonly string[]): boolean {
   if (stem === "doctor") return args[0] === "doctor" && isReadOnlyDiagnostic(args);
-  return stem === "utility" && (args[0] === "status" || args[0] === "version");
+  return stem === "utility" &&
+    (args[0] === "status" || args[0] === "version" || (args[0] === "now" && args.length === 1));
 }
 
 // Construction entry choices the person makes before the first Unit's plan
@@ -1211,6 +1258,11 @@ function onlyFlags(args: readonly string[], allowed: readonly string[]): boolean
   return true;
 }
 
+// The settings a scope or setting change the person asked for may carry. Guard
+// Policy, plan approval and the person's checks keep their own switch rules.
+const PLAN_WAIT_SETTINGS = ["depth", "test-strategy", "review", "sensors", "learnings", "collaborators"] as const;
+const PLAN_WAIT_SETTING_FLAGS = PLAN_WAIT_SETTINGS.map((setting) => `--${setting}`);
+
 const ENGINE_DIRECTED_WHILE_PLAN_WAITS: readonly EngineDirectedRoute[] = [
   // The review brief and the stage's own question rows (a checkpoint row keeps
   // its own rule).
@@ -1234,8 +1286,21 @@ const ENGINE_DIRECTED_WHILE_PLAN_WAITS: readonly EngineDirectedRoute[] = [
   // folder is, and the scan that follows it.
   { noun: "jump", verbs: ["execute", "reopen"], asked: true },
   { noun: "recompose", asked: true, admits: (afterNoun) => onlyFlags(afterNoun, ["--skip", "--add", "--reason"]) },
+  // A scope or setting change, which keeps the plan's question open.
+  {
+    noun: "scope", verbs: ["change"], asked: true,
+    admits: (afterNoun) => onlyFlags(afterNoun.slice(1), ["--scope", ...PLAN_WAIT_SETTING_FLAGS]),
+  },
+  {
+    noun: "config", verbs: ["set"], asked: true,
+    admits: (afterNoun) =>
+      (PLAN_WAIT_SETTINGS as readonly string[]).includes(afterNoun[1] ?? "") && afterNoun[2] !== undefined &&
+      onlyFlags(afterNoun.slice(3), PLAN_WAIT_SETTING_FLAGS),
+  },
   { noun: "intent", verbs: ["create"], asked: true },
   { noun: "workspace", verbs: ["reclassify", "codekb-scope-diff"], asked: true },
+  // A review the person asks for: its request and its verdict.
+  { noun: "log", verbs: ["review"], asked: true },
 ];
 
 function engineDirectedWhilePlanWaits(args: readonly string[], personAsked: () => boolean): boolean {
@@ -2256,6 +2321,13 @@ async function evaluate(
         if (
           WRITE_TOOLS.has(toolName) && !mutation.opaqueShell && mutation.targets.length > 0 &&
           mutation.targets.every((candidate) => isRepliedPlanFileTarget(projectDir, candidate, editable))
+        ) return 0;
+        // A review the person asked for runs while the plan waits: its own
+        // review file and dispatch record, and nothing else.
+        const reviewing = openReviewRequestFiles(projectDir);
+        if (
+          reviewing.length > 0 && !mutation.opaqueShell && mutation.targets.length > 0 &&
+          mutation.targets.every((candidate) => isOpenReviewTarget(projectDir, candidate, reviewing))
         ) return 0;
         authorityFailure = PLAN_APPROVAL_ASK_OPEN;
         standing = planStanding(projectDir, activeDirective);

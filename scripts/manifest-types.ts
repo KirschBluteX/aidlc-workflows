@@ -73,9 +73,13 @@ export type RootIntegration = {
    * Merge policy used by `aidlc config`; never inferred from the filename.
    * jsonc-settings edits a team's JSONC settings file in place: it adds each
    * shipped top-level key that is absent, never changes a key someone else
-   * set, and keeps other keys, comments, and layout.
+   * set, and keeps other keys, comments, and layout. json-entries does the
+   * same at any depth for a team's JSON file (opencode.json): AI-DLC's values
+   * and array strings are added when absent and followed or removed only
+   * while unchanged; its part ships in root-blocks, and a copy leaves the file
+   * out.
    */
-  policy: "managed-block" | "json-map" | "json-array" | "whole-file" | "jsonc-settings";
+  policy: "managed-block" | "json-map" | "json-array" | "whole-file" | "jsonc-settings" | "json-entries";
   /** Stable marker identity for managed-block integrations. */
   marker?: string;
   /**
@@ -153,6 +157,12 @@ export type HarnessManifest = {
      * for a harness without `agentStep` (which gives that sentence instead).
      */
     missedReply?: string;
+    /**
+     * `missedReply` for one host this tree runs in, told apart by environment
+     * variables that host sets for the agent's shell commands (any one
+     * non-empty). Without them, `missedReply` stands.
+     */
+    missedReplyInHost?: { env: string[]; text: string };
     /**
      * Set when a session can run without this tree's hooks after they ran in
      * an earlier one, so a reply can go unrecorded even with a heartbeat on

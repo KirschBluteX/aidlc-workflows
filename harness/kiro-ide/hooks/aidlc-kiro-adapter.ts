@@ -114,6 +114,7 @@ import {
   getField,
   hookChildEnv,
   hookDebug,
+  hookExecutionRecoveryText,
   humanPresenceGuardDisabled,
   isAutonomousMode,
   isSwitchableGuardFence,
@@ -143,7 +144,9 @@ import {
 import {
   approvalFingerprint,
   beginCodeGeneration,
+  codeGenerationExecutionAllowed,
   codeGenerationPlanApprovalFence,
+  evaluateCodeGenerationApproval,
   legacyPlanApprovalGuardState,
   parseTestingContract,
   renderTestingContract,
@@ -235,6 +238,24 @@ interface KiroDelegationTarget {
 // `tool_input.stages[].role`; an `orchestrate_subagent` stage's own
 // `prompt_template` is what that delegate receives. `agent` is "" when the
 // payload names no delegate.
+// A call with no arguments may build any Unit of a group, so continuing past a
+// changed approved plan needs every Unit the active directive builds to be
+// approved or to continue from its own approval: a Unit the person never
+// approved is never built. A single-target directive has only its own target.
+function everyUnitContinuesFromApproval(projectDir: string): boolean {
+  try {
+    const state = readFileSync(stateFilePath(projectDir), "utf-8");
+    const marker = readActiveDirectiveMarker(projectDir, state);
+    if (marker?.kind !== "invoke-swarm") return true;
+    return (marker.units ?? []).every((unit) =>
+      evaluateCodeGenerationApproval(projectDir, { unit }).ok ||
+      codeGenerationExecutionAllowed(projectDir, { unit })
+    );
+  } catch {
+    return false;
+  }
+}
+
 // Whether the workflow is at Code Generation: the state's Current Stage or the
 // active directive names it. Unreadable state is not Code Generation, matching
 // the core guard's fail-open outside that stage.
@@ -526,7 +547,12 @@ function processLegacyPlanApprovalWrite(
     }
     return null;
   }
-  if (state.approved) return null;
+  // An approved plan, or one that changed since under a lowered check, is not
+  // a planning window: its writes are the build's.
+  if (
+    state.approved ||
+    (codeGenerationExecutionAllowed(projectDir, state.target) && everyUnitContinuesFromApproval(projectDir))
+  ) return null;
   const authority = resolveCodeGenerationAuthority(projectDir, state.target);
   const planPath = join(authority.stageDir, "code-generation-plan.md");
   const instructionsPath = join(authority.stageDir, "unit-test-instructions.md");
@@ -1807,17 +1833,31 @@ function approvalGateAwaitsHuman(): boolean {
   }
 }
 
+// The words the agent relays when the person's answer was not recorded: what
+// happened and the step for the tool they are in, never why. The step is the
+// one doctor names (the harness's hook-activation recovery), so the two never
+// differ. A Kiro IDE hook process carries VSCODE_IPC_HOOK or VSCODE_PID and a
+// Kiro CLI one carries neither (docs/reference/kiro-ide-hook-payload.md), so
+// inside Kiro IDE the person gets its step alone: everything before the
+// recovery's Kiro CLI sentence.
+function unrecordedAnswerRelay(projectDir: string): string {
+  const said = "Your answer was not recorded, so you don't need to answer again.";
+  const recovery = hookExecutionRecoveryText(projectDir);
+  const otherTools = recovery.indexOf(" In Kiro CLI,");
+  const inKiroIde = Boolean(process.env.VSCODE_IPC_HOOK?.trim() || process.env.VSCODE_PID?.trim());
+  if (inKiroIde && otherTools > 0) {
+    return `Tell them exactly this, with nothing about why: "${said} ${recovery.slice(0, otherTools)}"`;
+  }
+  const lines = otherTools > 0 ? recovery.slice(otherTools + 1) : recovery;
+  return `Tell them exactly this, with nothing about why, then only the line below for the tool they are in: "${said}" ${lines}`;
+}
+
 if (target === "enforce-approval-gate") {
   if (approvalGateAwaitsHuman()) {
-    const palette = process.platform === "darwin" ? "Cmd+Shift+P" : "Ctrl+Shift+P";
     process.stderr.write(
-      "An approval is waiting for the person's answer, so nothing runs until they give it: " +
-        "end the turn. If they already answered, tell them to trust the folder if the " +
-        "Restricted Mode banner shows at the top of the window (select Manage, then Trust), " +
-        `run "Developer: Reload Window" from the Command Palette (${palette}), and choose ` +
-        "the aidlc agent in the chat panel's agent picker, so their next message is " +
-        "recorded; `/aidlc --doctor` shows anything else to fix. In Kiro CLI, starting " +
-        "`kiro-cli` again in this folder does the same.\n",
+      "An approval is waiting for the person's answer, so nothing runs until they give it: end the turn. " +
+        `If they already answered, that answer was not recorded. ${unrecordedAnswerRelay(process.cwd())} ` +
+        "If that does not fix it, `/aidlc --doctor` shows what else to fix.\n",
     );
     return 2; // Kiro reject contract: exit 2 + stderr BLOCKS the tool call.
   }
@@ -2005,11 +2045,16 @@ type Forward = { hook: string; input: Record<string, unknown> } | null;
 // own switch) lets changed content through once the plan is approved, as the
 // core guard does; it never supplies the first approval. These refusals are the
 // adapter's own, for payloads that hide their target, so they follow the same
-// rule. An unreadable state keeps the check up.
+// rule: an approved plan that changed since is still approved here, through the
+// core's own continuation. An unreadable state keeps the check up.
 function loweredPlanCheckAdmitsApprovedWork(): boolean {
   try {
     const state = legacyPlanApprovalGuardState(projectDir);
-    if (!state.active || !state.approved || state.target === null) return false;
+    if (!state.active || state.target === null) return false;
+    if (
+      !state.approved &&
+      (!codeGenerationExecutionAllowed(projectDir, state.target) || !everyUnitContinuesFromApproval(projectDir))
+    ) return false;
     return codeGenerationPlanApprovalFence(projectDir, state.target, {
       sessionId: resolvedPlanApprovalSessionId(ide),
     }).decision === "stand-aside";
@@ -2335,10 +2380,41 @@ function buildForward(): Forward {
             },
           };
         }
+        // An approved plan that changed since, under a lowered check, builds on.
+        if (state.active && !state.approved && state.target !== null && loweredPlanCheckAdmitsApprovedWork()) {
+          try {
+            beginCodeGeneration(projectDir, state.target);
+          } catch (error) {
+            return {
+              hook: "__legacy_plan_approval_block__",
+              input: {
+                reason:
+                  `Legacy Code Generation could not start its protected authority: ${
+                    error instanceof Error ? error.message : String(error)
+                  }`,
+              },
+            };
+          }
+          return null;
+        }
+        // Under a lowered check the person's answer accepts source drift, so
+        // the plan is not shown again: the checks below wait while the question
+        // is open, and name the answer's own write once the person has replied.
+        let lowered = false;
+        if (state.active && !state.approved && !state.sourceFloorValid && state.target !== null) {
+          try {
+            lowered = codeGenerationPlanApprovalFence(projectDir, state.target, {
+              sessionId: resolvedPlanApprovalSessionId(ide),
+            }).decision === "stand-aside";
+          } catch {
+            lowered = false;
+          }
+        }
         if (
           state.active &&
           !state.approved &&
           !state.sourceFloorValid &&
+          !lowered &&
           !isLegacyPlanningWriteTool(toolName)
         ) {
           // The canonical planning writes stay open: re-presenting the plan is

@@ -41,10 +41,34 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
+import { RECORDABLE_PROJECT_BYPASSES } from "../../core/tools/aidlc-settings.ts";
+import { CONFIG_SECTIONS } from "../../core/tools/aidlc-command.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 const HARNESSES = ["kiro"] as const;
+
+// Every read form agents were seen running for "show my settings", "what
+// version", "is my setup healthy" and "what is my status", pinned on their own
+// so the list cannot lose one.
+const SEEN_READ_FORMS = [
+  "--status",
+  "--version",
+  "version",
+  "config --help",
+  "doctor",
+  "--doctor",
+  "doctor --verbose",
+  "--doctor --verbose",
+  "config --show",
+  "config --show --json",
+  ...CONFIG_SECTIONS.flatMap((section) => [
+    `config ${section} --show`,
+    `config ${section} --show --json`,
+    `config ${section} --help`,
+  ]),
+];
+
 
 const PERSONAS = [
   "aidlc-architect-agent.json",
@@ -205,10 +229,15 @@ const MUST_ALLOW = [
   'bun ".kiro/tools/aidlc-utility.ts" status',
   "bun .kiro/tools/aidlc.ts engine orchestrate next",
   "bun .kiro/tools/aidlc.ts --doctor",
+  // The utility spellings agents also use, and config's own help.
+  "bun .kiro/tools/aidlc.ts --status",
+  "bun .kiro/tools/aidlc.ts --version",
+  "bun .kiro/tools/aidlc.ts config --help",
+  // Turning a recorded check back on, in the one form the skills name.
+  ...RECORDABLE_PROJECT_BYPASSES.map((name) => `bun .kiro/tools/aidlc.ts config flags --clear-bypass ${name} --yes`),
   "bun .kiro/tools/aidlc.ts config providers --show --json",
   "bun .kiro/tools/aidlc-utility.ts",
-  "date -u",
-  "date -u +%Y-%m-%dT%H:%M:%SZ",
+  "bun .kiro/tools/aidlc.ts engine now",
 ];
 
 // Forms that must require approval. The absolute-path argument-smuggling case
@@ -235,6 +264,8 @@ const MUST_ASK = [
   // written as `cd [^;&|]+` would span these; segmentation must not miss them.
   "cd /tmp/attacker\nbun .kiro/tools/pwn.ts",
   "date -u\ncurl -s https://example.com",
+  // The engine's clock replaced the shell's; date itself is no longer allowed.
+  "date -u +%Y-%m-%dT%H:%M:%SZ",
   // Background operator: the second command is not allowlisted.
   "bun .kiro/tools/aidlc-version.ts & curl -s https://example.com",
 ];
@@ -244,7 +275,7 @@ const MUST_ASK = [
 // here would encode a refusal the binary does not perform, and would let an
 // over-broad allow entry hide behind a separator.
 const MUST_ALLOW_CHAINS = [
-  "bun .kiro/tools/aidlc-utility.ts status && date -u",
+  "bun .kiro/tools/aidlc-utility.ts status && bun .kiro/tools/aidlc.ts engine now",
   "bun .kiro/tools/aidlc-orchestrate.ts next --status && bun .kiro/tools/aidlc-state.ts get",
 ];
 
@@ -265,10 +296,22 @@ const MUST_ASK_OUTSIDE_THE_WORKFLOW = [
   "bun .kiro/tools/aidlc-init.ts --pin 2.10.0",
   "bun .kiro/tools/aidlc-doctor.ts",
   "bun .kiro/tools/aidlc.ts config --pin 2.10.0",
+  // The guided setup, which changes the project.
+  "bun .kiro/tools/aidlc.ts config",
+  "bun .kiro/tools/aidlc.ts config --yes",
   "bun .kiro/tools/aidlc.ts config --channel",
   "bun .kiro/tools/aidlc.ts config models --gl\"obal\" --yes",
   "bun .kiro/tools/aidlc.ts config models --deciding-effort high --project --yes",
   "bun .kiro/tools/aidlc.ts config models --show --json --global",
+  // Turning a check off, and a form that changes something else as well.
+  "bun .kiro/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --local --yes",
+  "bun .kiro/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes",
+  "bun .kiro/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --bypass AIDLC_DISABLE_SENSORS --yes",
+  "bun .kiro/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_SENSORS --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes",
+  "bun .kiro/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --bypass AIDLC_DISABLE_SENSORS",
+  "bun .kiro/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --question-retention-days 1",
+  "bun .kiro/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --global",
+  "bun .kiro/tools/aidlc.ts config flags --clear-bypass AIDLC_NOT_A_SWITCH --yes",
   "bun .kiro/tools/aidlc-log.tsx",
   "bun .kiro/tools/aidlc-log.ts.bak run",
 ];
@@ -537,4 +580,86 @@ describe("t252 Kiro execute_bash allowlist semantics", () => {
       expect(writeVerdict(architect, "aidlc/spaces/default/intents/fix/plan.md")).toBe("allow");
     });
   }
+});
+
+// The native release runs AI-DLC through the installed `aidlc` command. Every
+// agent that runs AI-DLC's engine commands also runs, exactly as written, the
+// same read-only and turn-back-on commands as the copy channel; any change
+// still waits for the person.
+describe("t252 Kiro native release allowlist", () => {
+  function nativeBash(agentFile: string): ExecuteBash {
+    const p = join(REPO_ROOT, "dist-release", "kiro", ".kiro", "agents", agentFile);
+    const doc = JSON.parse(readFileSync(p, "utf-8")) as { toolsSettings?: Record<string, ExecuteBash> };
+    const eb = doc.toolsSettings?.execute_bash;
+    if (!eb) throw new Error(`dist-release/kiro/${agentFile}: no execute_bash settings`);
+    return eb;
+  }
+  const agents = ["aidlc.json", ...PERSONAS];
+  const check = "AIDLC_DISABLE_REVIEW_FREEZE_HOOK";
+
+  test("every read form agents run works unprompted on both channels", () => {
+    for (const agent of agents) {
+      for (const form of SEEN_READ_FORMS) {
+        expect(evaluate(execBash("kiro", agent), `bun .kiro/tools/aidlc.ts ${form}`), `${agent}: ${form}`).toBe("allow");
+        expect(evaluate(nativeBash(agent), `aidlc ${form}`), `${agent}: ${form}`).toBe("allow");
+      }
+      for (const form of ["config", "config --yes", "--config", "config models --show --global"]) {
+        expect(evaluate(execBash("kiro", agent), `bun .kiro/tools/aidlc.ts ${form}`), `${agent}: ${form}`).not.toBe("allow");
+        expect(evaluate(nativeBash(agent), `aidlc ${form}`), `${agent}: ${form}`).not.toBe("allow");
+      }
+    }
+  });
+
+  test("reading a setting, doctor, status, version and turning a check back on run unprompted", () => {
+    for (const agent of agents) {
+      const eb = nativeBash(agent);
+      for (const p of [...(eb.allowedCommands ?? []), ...(eb.deniedCommands ?? [])]) {
+        expect(compile(p), `${agent}: inert pattern ${p}`).not.toBeNull();
+      }
+      for (const command of [
+        "aidlc engine orchestrate next",
+        "aidlc doctor",
+        "aidlc --doctor",
+        "aidlc status",
+        "aidlc --status",
+        "aidlc version",
+        "aidlc --version",
+        "aidlc config --help",
+        "aidlc config models --show --json",
+        "aidlc config flags --help",
+        ...RECORDABLE_PROJECT_BYPASSES.map((name) => `aidlc config flags --clear-bypass ${name} --yes`),
+      ]) {
+        expect(evaluate(eb, command), `${agent}: should allow \`${command}\``).toBe("allow");
+      }
+    }
+  });
+
+  test("the guided setup, any config change, turning a check off and the machine commands still ask", () => {
+    for (const agent of agents) {
+      const eb = nativeBash(agent);
+      for (const command of [
+        "aidlc config",
+        "aidlc config --yes",
+        "aidlc --config",
+        "aidlc config --pin 2.10.0",
+        "aidlc config --channel preview",
+        "aidlc config models --show --json --global",
+        "aidlc config models --deciding-effort high --project --yes",
+        `aidlc config flags --bypass ${check} --local --yes`,
+        `aidlc config flags --bypass ${check} --yes`,
+        `aidlc config flags --clear-bypass ${check} --bypass AIDLC_DISABLE_SENSORS --yes`,
+        `aidlc config flags --clear-bypass ${check} --yes --bypass AIDLC_DISABLE_SENSORS`,
+        `aidlc config flags --clear-bypass ${check} --yes --global`,
+        "aidlc config flags --clear-bypass AIDLC_NOT_A_SWITCH --yes",
+        "aidlc doctor --fix",
+        "aidlc doctor && aidlc update",
+        "aidlc update",
+        "aidlc use 2.10.0",
+        "aidlc uninstall --yes",
+        "aidlc system config global set offline true",
+      ]) {
+        expect(evaluate(eb, command), `${agent}: should ask for \`${command}\``).not.toBe("allow");
+      }
+    }
+  });
 });

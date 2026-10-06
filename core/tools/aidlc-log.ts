@@ -14,6 +14,7 @@ import {
   humanRepliedSinceGate,
   NoGuardRecoveryAskError,
   recordGuardRecoveryChoice,
+  requestChangesReportCommand,
   releaseTakenGuardRecoveryReply,
   assertNoSymlinkInChainOrThrow,
   codekbRepoName,
@@ -514,6 +515,27 @@ function summaryQuestionEvidence(
   };
 }
 
+// The session the Verification Command question and its answer belong to. As
+// with a Unit's checkpoint, the tool finds the session it runs in; `--session`
+// is only an override, so the agent never has to look its own session up.
+function verificationCommandSession(pd: string, flags: Record<string, string>): string {
+  let session = flags.session?.trim() ?? "";
+  if (!session) {
+    try {
+      session = resolveInvokingSessionId(pd) ?? "";
+    } catch (e) {
+      error(errorMessage(e));
+    }
+  }
+  if (!session) {
+    error(
+      "Could not tell which session this is. Run the command again with --session set to the Runtime Session " +
+        "shown in this session's AI-DLC context.",
+    );
+  }
+  return session;
+}
+
 // A Plan Approval prompt the human's answer cannot reach still records; the
 // output says so before the conductor presents it. Only a named --session can
 // be a guess; an auto-resolved one came from the invoking conversation.
@@ -896,11 +918,7 @@ function handleDecision(args: string[]): void {
     fields.Checkpoint = VERIFICATION_COMMAND_CHECKPOINT;
     fields["Command SHA-256"] = verificationCommand.sha256;
     fields["Command Label"] = verificationCommand.label;
-    const session = flags.session?.trim();
-    if (!session) {
-      error("Verification command requires --session <id> from the invoking SessionStart context. " + VERIFICATION_COMMAND_RECOVERY);
-    }
-    fields.Session = session;
+    fields.Session = verificationCommandSession(pd, flags);
     const options = (flags.options ?? "").split(",").map((option) => option.trim().toLowerCase());
     if (options.length !== 2 || options[0] !== "approve" || options[1] !== "request changes") {
       error('Verification command decision requires --options "Approve,Request Changes". ' + VERIFICATION_COMMAND_RECOVERY);
@@ -1588,7 +1606,7 @@ function handleAnswer(args: string[]): void {
   // same reply also said what should change.
   if (flags.checkpoint === "guard-recovery") {
     const pd = resolveActiveProjectDir(projectDir);
-    let picked: { op: string; action: string; awaitingWords: boolean };
+    let picked: { op: string; action: string; awaitingWords: boolean; stage: string; unit?: string };
     try {
       picked = recordGuardRecoveryChoice(pd, flags.details, /:\s*\S/.test(flags.details));
     } catch (e) {
@@ -1605,10 +1623,18 @@ function handleAnswer(args: string[]): void {
       }
       error(errorMessage(e));
     }
-    const message = picked.awaitingWords && picked.op === "request-changes"
-      ? 'Recorded that the person chose Request Changes. Ask "What should change?" and end the turn; their ' +
-        "next reply is what should change."
-      : `Recorded that the person chose "${picked.action}". Carry it out now.`;
+    // Request Changes names the exact report, so the agent never guesses its
+    // flags: a solo walk reports the stage, a team-owned Unit gate its Unit.
+    const report = picked.op === "request-changes"
+      ? `run \`${requestChangesReportCommand(pd, picked.stage, picked.unit)}\` with their exact words added ` +
+        "as a single-quoted --reason."
+      : "";
+    const message = picked.op !== "request-changes"
+      ? `Recorded that the person chose "${picked.action}". Carry it out now.`
+      : picked.awaitingWords
+        ? 'Recorded that the person chose Request Changes. Ask "What should change?" and end the turn; their ' +
+          `next reply is what should change. Then ${report}`
+        : `Recorded that the person chose Request Changes. Now ${report}`;
     console.log(JSON.stringify({ recorded: picked.op, message }));
     return;
   }
@@ -1743,11 +1769,7 @@ function handleAnswer(args: string[]): void {
     fields["Command SHA-256"] = verificationCommand.sha256;
     fields["Command Label"] = verificationCommand.label;
     fields["User Input"] = flags.details;
-    const session = flags.session?.trim();
-    if (!session) {
-      error("Verification command requires --session <id> from the invoking SessionStart context. " + VERIFICATION_COMMAND_RECOVERY);
-    }
-    fields.Session = session;
+    fields.Session = verificationCommandSession(pd, flags);
   }
   if (policyFields) {
     Object.assign(fields, policyFields);

@@ -2,7 +2,7 @@
 // function:recordAcceptedChanges, function:acceptedReviewChanges, function:renderReviewBrief,
 // subcommand:aidlc-state:approve, subcommand:aidlc-state:gate-start,
 // subcommand:aidlc-log:review, subcommand:aidlc-orchestrate:report,
-// hook:aidlc-review-freeze, hook:aidlc-plan-approval-guard, audit:CHANGE_ACCEPTED
+// hook:aidlc-review-freeze, hook:aidlc-plan-approval-guard, audit:CHANGE_ACCEPTED, function:unitPlainName
 //
 // t335 - Guard Policy at the review-receipt and summary-confirmation
 // checkpoints, and the checkpoints it never bypasses. Under `relaxed` (and
@@ -47,6 +47,7 @@ import {
   sessionsDir,
   setGuardsOffLine,
   stateDigest,
+  unitPlainName,
   writeActiveDirectiveMarker,
 } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
 import {
@@ -301,6 +302,21 @@ describe("t335 (1) review receipt: relaxed keeps the verdict and carries the cha
     );
     expect(brief.stdout).toContain(`**Changed after review:** \`${artifactRelative(proj)}\``);
     expect(brief.stdout).toContain("**Decision options:**");
+  });
+
+  // An edit made in an editor leaves no write record, so no file can be named:
+  // the line names the stage's documents, never one of them that may not have
+  // changed.
+  test("a hand edit is said as the stage's documents, not one document's name", () => {
+    const proj = project("relaxed");
+    recordReadyReview(proj);
+    appendFileSync(artifact(proj), "\nA requirement added by hand.\n", "utf-8");
+    const receipts = freshReviewReceipts(proj, readFileSync(seededStateFile(proj), "utf-8"), stage());
+    expect(receipts.acceptedChanges).toHaveLength(1);
+    expect(receipts.acceptedChanges[0].changed).toBeNull();
+    expect(receipts.acceptedChanges[0].notice).toBe(
+      "The Requirements Analysis documents changed after they were reviewed; carrying on.",
+    );
   });
 
   test("the engine's report carries the change line onto its directive", () => {
@@ -982,11 +998,14 @@ describe("t335 (5) a team-owned Unit gate runs the same checkpoint", () => {
     expect(gate.status, gate.stderr).toBe(0);
     const relativeArtifact = relative(proj, reviewedUnitArtifact(proj)).replaceAll("\\", "/");
     expect(printedNotices(gate.stdout)).toEqual([
-      `${relativeArtifact} changed after Unit alpha's review; carrying on.`,
+      `${relativeArtifact} changed after the alpha Unit was reviewed; carrying on.`,
     ]);
     const rows = acceptedRows(proj);
     expect(rows).toHaveLength(1);
     expect(auditBlockField(rows[0].block, "Unit")).toBe(UNIT);
+    // The line names the Unit in plain words, never its numbered id.
+    expect(unitPlainName("u1-note-store")).toBe("note store");
+    expect(unitPlainName("payments_api")).toBe("payments api");
     expect(auditBlockField(rows[0].block, "Checkpoint")).toBe("review-receipt");
     // The verdict stands as recorded; the gate presented again writes nothing more.
     expect(reviewCompletedRows(proj)).toHaveLength(1);
@@ -1034,6 +1053,18 @@ describe("t335 (5) a team-owned Unit gate runs the same checkpoint", () => {
     expect(refused.stderr).toContain(`Refusing gate for unit \\"${UNIT}\\"`);
     expect(acceptedRows(proj)).toHaveLength(0);
   });
+
+  test("a hand edit of the Unit's document is said as its stage's documents", () => {
+    const proj = teamProject("relaxed");
+    settleUnit(proj);
+    appendFileSync(reviewedUnitArtifact(proj), "\nA rule added by hand.\n", "utf-8");
+    const gate = run(STATE_TOOL, ["gate-start", UNIT_STAGE, "--unit", UNIT], proj, UNIT_ENV);
+    expect(gate.status, gate.stderr).toBe(0);
+    expect(printedNotices(gate.stdout)).toEqual([
+      "The alpha Unit's Functional Design documents changed after they were reviewed; carrying on.",
+    ]);
+    expect(acceptedRows(proj)).toHaveLength(1);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   test("an invalid memory Mode is the validation error at the Unit gate", () => {
     const proj = teamProject("relaxed");

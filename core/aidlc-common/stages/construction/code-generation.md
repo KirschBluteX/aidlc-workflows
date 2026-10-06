@@ -356,10 +356,11 @@ bun {{HARNESS_DIR}}/tools/aidlc-log.ts answer --stage code-generation --checkpoi
 
 ### Step 4: PART 2 — Generation
 
-Before delegating, display to the user:
-"Generating code for [N] plan steps. This may take several minutes depending on project complexity. I'll show a summary when complete."
-When the directive's `narration` says where an interrupted build picks up, say
-that line instead.
+The directive's `narration` is the user's line for this build: the engine
+counts the plan the way the plan file shows it ("Generating code for 9 plan
+steps. This may take several minutes ...") or says where an interrupted build
+picks up. Say it once before delegating if you have not yet; never count the
+plan's steps yourself.
 
 Delegate to Task tool with subagent_type="aidlc-developer-agent".
 
@@ -390,8 +391,11 @@ Include in the delegation prompt:
   plan file into the prompt yourself; the subagent ticks its progress in the
   plan file, not in the prompt. When a build of this same approved plan was
   interrupted, the output also carries a `## Progress before the interruption`
-  section after its two marker lines: the steps the plan file ticks, any to
-  redo because their files are missing, and the step to continue at
+  section after its two marker lines: the steps done (the ones the plan file
+  ticks or, with none ticked, the ones whose named files changed since the build
+  started), any file a done step names that is not in the project (the step may
+  say not to add it: redo the step only if it should have made that file), and
+  the step to continue at
 - Project workspace details (languages, frameworks, conventions from aidlc-state.md)
 - Instructions to execute each plan step sequentially and mark checkboxes as
   completed, starting where that progress section says when the output has one.

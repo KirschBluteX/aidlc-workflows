@@ -1768,7 +1768,7 @@ describe("t248 deterministic steering delivery", () => {
     }
   });
 
-  test("Standard depth keeps the complete shipped knowledge roster", () => {
+  test("Standard depth keeps the complete shipped methodology roster", () => {
     const proj = project();
     const result = drive(proj, [
       "--scope",
@@ -1778,7 +1778,11 @@ describe("t248 deterministic steering delivery", () => {
     ]);
     const paths = result.final.inline_context_paths ?? [];
 
+    // The shared methodology stays; the format references never join a roster.
     expect(paths).toContain(
+      ".claude/knowledge/aidlc-shared/ai-dlc-principles.md",
+    );
+    expect(paths).not.toContain(
       ".claude/knowledge/aidlc-shared/audit-format.md",
     );
     expect(paths).toContain(
@@ -2141,7 +2145,12 @@ describe("t248 reviewer knowledge absorption", () => {
         expect(surface).toContain(
           `Absorbed at build time from knowledge/${reviewer}/reviewing.md`,
         );
-        expect(surface).toContain(source);
+        // The build writes {{INVOKE}} as this harness's own AI-DLC command.
+        const absorbed = source
+          .split("{{INVOKE}}")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("[^`\\n]+");
+        expect(surface).toMatch(new RegExp(absorbed));
       }
     });
   }

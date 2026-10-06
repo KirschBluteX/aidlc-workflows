@@ -73,8 +73,10 @@ For an air-gapped package, use
 `& $installer -From <release-directory> -Offline` on Windows.
 
 `aidlc config` projects the Kiro shell before the project is opened. The native
-`aidlc engine *` trust grant ships inside the permissions of the conductor
-(`.kiro/agents/aidlc.md`) and of every agent it hands work to. Some commands are
+`aidlc engine *` trust grant, and the exact read-only and turn-back-on commands
+listed for a copied project below, ship inside the permissions of the conductor
+(`.kiro/agents/aidlc.md`); every agent it hands work to is denied those
+commands. Some commands are
 held back from it: `aidlc engine config set *` changes a setting of your piece
 of work, `aidlc engine adapter *` is the entry the IDE's own hooks run, and a
 command holding `$`, a backtick, `>`, `<`, `&`, `@(`, `@{`, or a line break can
@@ -140,6 +142,18 @@ of `.kiro/`, so copy it separately (or copy the whole
 `$RUNTIME_ROOT/kiro-ide/` tree at once). `/aidlc --doctor` fails its
 "workspace shell ready" check if it is missing.
 
+In a copied project, the `aidlc` agent runs AI-DLC's engine commands
+(`bun .kiro/tools/aidlc.ts engine ...`), its tool scripts, its read-only
+commands (`doctor` and `--doctor`, with or without `--verbose`, `version`,
+`--version`, `status`, `--status`, `config --help`, `config --show` and
+`config <section> --show` with or without `--json`, and
+`config <section> --help`) and turning a check back on
+(`config flags --clear-bypass <switch> --yes`) with no card. A native install
+runs the same commands, as `aidlc ...`, with no card too. Any other
+`config` change (bare `config`, the guided setup, included), the commands that change the machine's AI-DLC install (`use`,
+`update`, `rollback`, `uninstall`, `system`), and a command holding `$`, a
+backtick, `>`, `<`, `&`, `@(`, `@{`, or a line break show Kiro's card first.
+
 The versioned runtime uses the native `aidlc` command. Framework developers who
 need the Bun-shaped source projection can clone the repository, run
 `bun install --frozen-lockfile` and `bun scripts/package.ts`, then use the
@@ -172,7 +186,7 @@ The install ships:
   pipeline-deploy persona creates, merges, discards, and restores Bolt
   worktrees.
   No agent-v1 JSON ships. Their shell
-  rules run AI-DLC's own commands, `date -u`, and `bun --version` without
+  rules run AI-DLC's own commands and `bun --version` without
   asking; the project's own test and build commands still ask.
 - `.kiro/settings/cli.json` — pins Kiro CLI to its v3 engine and the `aidlc`
   agent. Kiro CLI's default v2 engine runs none of the `.kiro/hooks/`
@@ -368,7 +382,7 @@ host shares it and is judged by the gates of the workflow it is bound to.
 | `aidlc-terminal-command` | `UserPromptSubmit` | Runs status, doctor, help, navigation, and other terminal utilities before the model when prompt text is available, for the chat that typed the command |
 | `aidlc-terminal-command-guard` | `PreToolUse` (`execute_bash\|execute_pwsh\|shell`) | Fallback for empty-prompt IDE versions: runs the classified utility once and refuses the duplicate Windows shell call. On Windows it also refuses an `aidlc` command with a value that cmd.exe would split (see the Windows quotes row below) |
 | `aidlc-continue-workflow` | `Stop` | Forwarding-loop audit (advisory-only; the Stop trigger cannot block on the IDE - enforcement relies on the conductor's own Stop protocol) |
-| `aidlc-block` | `PreToolUse` | Hard-blocks tool calls while an approval gate the person must answer is open and no human has acted since (human-presence floor). A gate AI-DLC approves itself, such as a Construction stage gate once every Unit's checkpoint is approved, does not hold it, and neither does the one Construction setting the person just chose |
+| `aidlc-block` | `PreToolUse` | Hard-blocks tool calls while an approval gate the person must answer is open and no human has acted since (human-presence floor); the read-only Review brief still prints. A gate AI-DLC approves itself, such as a Construction stage gate once every Unit's checkpoint is approved, does not hold it, and neither does the one Construction setting the person just chose |
 | `aidlc-write-audit-log` | `PostToolUse` (`fs_write\|str_replace\|fs_append`) | Logs artifact create/update, then fires applicable sensors (path from the tool result) |
 | `aidlc-plan-approval-guard` | `PreToolUse` | Enforces Code Generation Plan Approval with exact target classification when arguments are present. The shell tool is recognised under all three IDE names, `execute_bash`, `execute_pwsh` (Windows), and `shell`: each is forwarded to the shared guard as `Bash` and routed to legacy recovery identically, and with no active workflow no shell call is denied. `execute_pwsh` is marked as PowerShell, so while a plan waits for approval read-only cmdlets (`Get-Content`, `Select-Object`, `ConvertFrom-Json`, ...), `2>$null`, and `aidlc.cmd` or the full path of the installed engine still run; `Out-File`, `Set-Content`, `Add-Content`, `Tee-Object`, and `>` into a file do not. Legacy argument-less payloads permit only measured `fs_write`/`str_replace` plan-question writes as far as this hook goes; `aidlc-review-freeze` and `aidlc-state-transition-guard` refuse such a write, so it does not run. PostToolUse stays silent because 0.12 discards that output; the invoking Code Generation `next`/final `continue` directive carries one protected choice capability. Recovery first requires an exact human `Recover Plan Approval` response; another live window cannot initiate it, while a replacement window can recover after the owner PID exits or an IPC-only endpoint disappears. Takeover clears old response evidence before rotating the challenge. An interrupted pre-write window remains a recovery latch even when PostToolUse never runs; definitive `toolSuccess:false` or recognized failure prose clears it because no mutation occurred, while unknown outcomes remain latched. Adapter-owned recovery preserves the human ask while clearing only violation/window state after successful reissue. `UserPromptSubmit` can submit exact recovery/approval labels but cannot reveal or transfer them. Unknown mutators fail closed and shared files/audit retain no plaintext secret. |
 | `aidlc-review-freeze` | `PreToolUse` | Refuses a write or shell mutation of a stage's reviewed output while a fresh terminal review receipt covers it, before the gate. Write tools reach the shared hook as Write/Edit with their target path and shell tools as Bash, with the chat's session; a delegated agent's own writes are judged the same way. An `execute_pwsh` command is read as PowerShell (backslash paths, `Set-Location`), here and in `aidlc-state-transition-guard`. A call whose input cannot be read (a build older than Kiro IDE 1.1.70 or Kiro CLI 2.24.1 can send one with no arguments) is refused before the hook runs, inside or outside a workflow and with `AIDLC_DISABLE_REVIEW_FREEZE_HOOK=1`, with a line naming the supported builds. |

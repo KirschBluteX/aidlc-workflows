@@ -87,7 +87,10 @@ Create `harness/<name>/manifest.ts` exporting a `HarnessManifest`
   Otherwise, or for a harness without `agentStep`, that refusal gives
   `missedReply` instead (an `AIDLC_UNATTENDED=1`
   run gets its own explanation), worded for a person who may not have replied
-  yet ("If the person already replied, ..."). Set `notRunYet` only when the
+  yet ("If the person already replied, ..."). `missedReplyInHost`
+  (`{ env, text }`) gives one host its own line when any of the named
+  environment variables is set in the agent's shell; Kiro IDE uses it for
+  `VSCODE_IPC_HOOK`/`VSCODE_PID`. Set `notRunYet` only when the
   harness's hooks leave a heartbeat on every chat message, the first one before
   any workflow included (the human-turn hook does, and so do the Copilot and
   Kiro IDE adapters); doctor then warns with that text while no heartbeat
@@ -117,7 +120,13 @@ Create `harness/<name>/manifest.ts` exporting a `HarnessManifest`
   assistant".
 - `rootIntegrations` — every project-root file emitted by the normal projection,
   each with an explicit init merge policy (`managed-block`, `json-map`,
-  `json-array`, `whole-file`, or `jsonc-settings`). `jsonc-settings` is for an
+  `json-array`, `whole-file`, `jsonc-settings`, or `json-entries`).
+  `json-entries` is for a team's own JSON config file (opencode's
+  `opencode.json`): config adds AI-DLC's values and array strings at any depth
+  only where absent, adds a map's `"*"` rule only when the map has none, keeps
+  everything else, and follows or retires only entries still holding the value
+  it wrote; its part ships in root-blocks and the copy runtime leaves the file
+  out. `jsonc-settings` is for an
   editor's own JSONC settings file (Copilot's `.vscode/settings.json`): config
   adds each shipped top-level key only when the project does not set it, never
   changes a value someone else set, keeps every other key, comment, and line,
@@ -277,6 +286,12 @@ tool/hook. No blind `sed`. Truthful harness-specific literals in `core/` (the
 `$CLAUDE_PROJECT_DIR` note, the harness-dir enumeration in
 workspace-detection) carry no token and pass through unchanged; the core-hygiene
 and native-projection tests guard the boundary.
+
+One more projection keeps each tree to its own tool. The construction, topology,
+reviewer and swarm protocol modules each end with one `### <tool>` binding
+subsection per harness, and `scripts/harness-bindings.ts` ships a tree only its
+own. To port: add your tool's subsection to each of those runs and its heading
+to `BINDING_HEADINGS`. Until you do, your tree ships every tool's subsection.
 
 ## Step 5 — tests + the gate
 

@@ -436,11 +436,12 @@ export function applyIntentSettings(
     die(guardSwitchRefusal(lowering[0], "config"));
   }
   // Lowering a fence is the person's call. Their typed switch carries it out,
-  // and so does this setter when a person has spoken since the last decision:
+  // and so does this setter when a person has spoken since the last decision
+  // (the approval they gave in the same message leaves the rest of it standing):
   // the conductor runs what they asked for, in their own words.
   if (
     lowering.length > 0 && !typedByPerson && !fenceKeyBypassed(projectDir, sessionId) &&
-    !personSpokeSinceGate(projectDir, { requests: true })
+    !personSpokeSinceGate(projectDir, { requests: true, outlivesApproval: true })
   ) {
     // A question about the switch ("skip plan approval?") asks for nothing.
     die(guardSwitchRefusal(lowering[0], "config", personSpokeSinceGate(projectDir)));
@@ -449,7 +450,8 @@ export function applyIntentSettings(
   const askedIn = lowering.length > 0 && !typedByPerson ? latestPersonTurn(projectDir)?.words ?? null : null;
   // Asked for in the chat (not typed): each check it turns off is said in one
   // line, in their words, with the way back, instead of the setter's own line.
-  const askedInChat = lowering.length > 0 && !typedByPerson && personSpokeSinceGate(projectDir, { requests: true });
+  const askedInChat = lowering.length > 0 && !typedByPerson &&
+    personSpokeSinceGate(projectDir, { requests: true, outlivesApproval: true });
   const saidAsAsked = (key: string): boolean =>
     askedInChat && key !== "plan-approval" && lowering.some((item) => item.key === key);
 
@@ -709,10 +711,27 @@ export function applyTypedGuardSwitchPrompt(
   if (parsed.newWorkGuardPolicy !== undefined && parsed.error === null) {
     forNewWork.push(grantGuardPolicyAtCreation(projectDir, sessionId, parsed.space, parsed.newWorkGuardPolicy, true));
   }
+  // Sensors, learnings or summary confirmation typed with the new work, or
+  // before any work exists, are the person's: the work this chat creates next
+  // says they were set by them.
+  if (parsed.error === null) {
+    if (parsed.newWorkCeremonies !== undefined) {
+      recordCeremoniesAtCreation(projectDir, sessionId, parsed.newWorkCeremonies, true);
+    } else if (parsed.words === undefined) {
+      const typed = Object.fromEntries(parsed.settings
+        .filter((setting) => CREATION_CEREMONY_FLAGS.includes(setting.key) && (setting.value === "on" || setting.value === "off"))
+        .map((setting) => [setting.key, setting.value as "on" | "off"]));
+      if (Object.keys(typed).length > 0 && noWorkSelected(projectDir, sessionId, parsed)) {
+        recordCeremoniesAtCreation(projectDir, sessionId, typed, false);
+      }
+    }
+  }
   if (forNewWork.length > 0 && parsed.switches.length === 0) {
     return { applied: forNewWork.every((outcome) => outcome.applied), lines: forNewWork.flatMap((outcome) => outcome.lines) };
   }
-  if (parsed.switches.length === 0) return null;
+  // A raise typed with the answer to the open code plan question is for this
+  // work too ("/aidlc --guard-policy strict Approve Plan").
+  if (parsed.switches.length === 0 && !(options.wordsAnswer === true && parsed.settings.length > 0)) return null;
   if (parsed.error !== null) return { applied: false, lines: [parsed.error] };
   if (parsed.scope !== null && !validScopes().has(parsed.scope)) {
     return { applied: false, lines: [`Unknown scope "${parsed.scope}".`] };
@@ -1059,4 +1078,103 @@ export function guardPolicyCreationGranted(
 export function consumeGuardPolicyCreationGrant(projectDir: string, sessionId: string | null): void {
   if (!sessionId) return;
   removePlanApprovalRuntimeRecord(guardPolicyCreationGrantPath(projectDir, sessionId));
+}
+
+// Sensors, learnings and summary confirmation the person typed with the new
+// work, or before any work existed: their words, kept by the human-turn hook,
+// so the work this chat creates for that request says they set them.
+const CREATION_CEREMONY_FLAGS = ["sensors", "learnings", "summary-confirmation"];
+
+interface CeremoniesCreationGrant extends PlanApprovalCreationGrant {
+  settings: Record<string, "on" | "off">;
+}
+
+function ceremoniesCreationGrantPath(projectDir: string, sessionId: string): string {
+  const segment = sessionId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 96);
+  return planApprovalRuntimeFile(projectDir, `ceremonies-at-creation-${segment}.json`);
+}
+
+function readCeremoniesCreationGrant(projectDir: string, sessionId: string): CeremoniesCreationGrant | null {
+  const grant = readPlanApprovalRuntimeRecord<CeremoniesCreationGrant>(
+    ceremoniesCreationGrantPath(projectDir, sessionId),
+    "ceremony creation grant",
+  );
+  return grant?.version === 1 && grant.session === sessionId && typeof grant.settings === "object" && grant.settings !== null
+    ? grant : null;
+}
+
+// No piece of work is selected for this chat, or it has no state yet.
+function noWorkSelected(
+  projectDir: string,
+  sessionId: string,
+  parsed: { space: string | null; intent: string | null },
+): boolean {
+  try {
+    const selection = resolveWorkflowSelection(projectDir, {
+      sessionId,
+      ...(parsed.space === null ? {} : { space: parsed.space }),
+      ...(parsed.intent === null ? {} : { intent: parsed.intent }),
+    });
+    return selection.intent === null || !existsSync(stateFilePath(projectDir, selection.intent, selection.space));
+  } catch {
+    return false;
+  }
+}
+
+function recordCeremoniesAtCreation(
+  projectDir: string,
+  sessionId: string,
+  settings: Record<string, "on" | "off">,
+  withDescription: boolean,
+): void {
+  try {
+    // A later word on one setting replaces the earlier one; the others stay.
+    let earlier: Record<string, "on" | "off"> = {};
+    try {
+      earlier = readCeremoniesCreationGrant(projectDir, sessionId)?.settings ?? {};
+    } catch {
+      // An unreadable earlier record is replaced by this one.
+    }
+    const grant: CeremoniesCreationGrant = {
+      version: 1,
+      session: sessionId,
+      settings: { ...earlier, ...settings },
+      request: withDescription ? null : latestFrontQuestionId(projectDir, OPEN_QUESTION_WINDOW_MS),
+      recordedAt: isoTimestamp(),
+      ...(withDescription ? { withDescription: true as const } : {}),
+    };
+    writePlanApprovalRuntimeRecord(projectDir, ceremoniesCreationGrantPath(projectDir, sessionId), `${JSON.stringify(grant)}\n`);
+  } catch {
+    // The label is the only thing at stake: a record that cannot be written leaves "set by a command".
+  }
+}
+
+/** The ceremonies the person typed in this chat for the request it answered, by ceremony key. */
+export function ceremoniesCreationGranted(
+  projectDir: string,
+  sessionId: string | null,
+  request: string | null = null,
+): Partial<Record<CeremonyKey, "on" | "off">> {
+  if (!sessionId || request === null || process.env.AIDLC_UNATTENDED === "1") return {};
+  try {
+    const grant = readCeremoniesCreationGrant(projectDir, sessionId);
+    if (grant === null) return {};
+    const answered = grant.request ??
+      firstFrontQuestionSince(projectDir, grant.recordedAt, OPEN_QUESTION_WINDOW_MS, { routing: grant.withDescription === true });
+    if (answered === null || (answered !== request && readQuestion(projectDir, request)?.composedFrom !== answered)) return {};
+    const out: Partial<Record<CeremonyKey, "on" | "off">> = {};
+    for (const [flag, value] of Object.entries(grant.settings)) {
+      const key = CEREMONY_KEYS.find((candidate) => CEREMONY_FLAGS[candidate] === `--${flag}`);
+      if (key !== undefined && key !== "plan_approval" && (value === "on" || value === "off")) out[key] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Spent by the next piece of work this chat creates, as Guard Policy is. */
+export function consumeCeremoniesCreationGrant(projectDir: string, sessionId: string | null): void {
+  if (!sessionId) return;
+  removePlanApprovalRuntimeRecord(ceremoniesCreationGrantPath(projectDir, sessionId));
 }

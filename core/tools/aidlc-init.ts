@@ -47,17 +47,21 @@ import {
   aidlcHookTarget,
   assertProjectionPathHasNoSymlinks,
   hostToolPath,
+  emptyJsonObject,
   insertJsoncSetting,
+  type JsonEntriesOwnership,
   jsonFileText,
   isCustomClaudeStatusLine,
   jsoncRootMembers,
   jsoncSettingValue,
   legacyAidlcHookTarget,
   mergeBlock,
+  mergeJsonEntries,
   type ProjectionDescriptor,
   projectionFiles,
   readJsonFile,
   readRootIntegrations,
+  removeJsonEntries,
   removeJsoncSetting,
   replaceJsoncSetting,
   copyStartsWithout,
@@ -276,7 +280,10 @@ type RootContribution =
   | { policy: "whole-file"; hash: string }
   // Only the settings AI-DLC itself added, with the value it wrote; created
   // records that the file did not exist before.
-  | { policy: "jsonc-settings"; entries: Record<string, string>; added?: string[]; created?: boolean };
+  | { policy: "jsonc-settings"; entries: Record<string, string>; added?: string[]; created?: boolean }
+  // Each entry AI-DLC owns in a team's JSON file (opencode.json), with the
+  // value hash it wrote; created records that AI-DLC created the file.
+  | { policy: "json-entries"; entries: Record<string, string>; created?: boolean };
 
 type Baseline = {
   schemaVersion: 1;
@@ -845,7 +852,24 @@ function validateChannelConfigArgs(argv: readonly string[]): string | null {
   return validateConfigOutputMode(argv);
 }
 
+// `config --show [--json]` reads every section and changes nothing, so it takes
+// only the flags that shape its output and --project-dir.
+const ROOT_SHOW_BARE_FLAGS = new Set(["--show", "--json", "--no-color", "--help"]);
+
+function validateRootShowArgs(argv: readonly string[]): string | null {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--project-dir") {
+      i++;
+      continue;
+    }
+    if (!ROOT_SHOW_BARE_FLAGS.has(token)) return `${token} cannot be combined with config --show`;
+  }
+  return argv.filter((token) => token === "--show").length > 1 ? "--show may be specified only once" : null;
+}
+
 function validateRootConfigArgs(argv: readonly string[]): string | null {
+  if (argv.includes("--show")) return validateRootShowArgs(argv);
   const hasPin = argv.includes("--pin");
   const hasUnpin = argv.includes("--unpin");
   if (hasPin && hasUnpin) return "--pin and --unpin are mutually exclusive";
@@ -3943,6 +3967,8 @@ function contributionValid(entry: unknown): boolean {
       return isStringMap(entry.entries) &&
         (entry.added === undefined || (Array.isArray(entry.added) && entry.added.every((key) => typeof key === "string"))) &&
         (entry.created === undefined || typeof entry.created === "boolean");
+    case "json-entries":
+      return isStringMap(entry.entries) && (entry.created === undefined || typeof entry.created === "boolean");
     default:
       return false;
   }
@@ -4980,13 +5006,30 @@ function preserveCodexProviderFields(
   return merged.frameworkOwnedClean;
 }
 
+// True when the staged release merges opencode.json per entry: the team's
+// provider block is then never copied into AI-DLC's part, so it is never read
+// as AI-DLC's.
+function stagedOpenCodeJsonEntries(stagedRoot: string): boolean {
+  try {
+    const descriptor = readJsonFile(join(stagedRoot, ".aidlc", "tools", "data", "aidlc-projection.json")) as {
+      rootIntegrations?: unknown;
+    };
+    const integrations = readRootIntegrations(descriptor.rootIntegrations);
+    return Array.isArray(integrations) && integrations.some((integration) =>
+      isRecord(integration) && integration.path === "opencode.json" && integration.policy === "json-entries"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function preserveOpenCodeProviderFields(
   projectDir: string,
   stagedRoot: string,
 ): void {
   const currentPath = join(projectDir, "opencode.json");
   const stagedPath = join(stagedRoot, "opencode.json");
-  if (!regularFile(currentPath) || !regularFile(stagedPath)) return;
+  if (!regularFile(currentPath) || !regularFile(stagedPath) || stagedOpenCodeJsonEntries(stagedRoot)) return;
   const currentText = readFileSync(currentPath, "utf-8");
   const current = JSON.parse(withoutBom(currentText)) as Record<string, unknown>;
   if (!current.provider || typeof current.provider !== "object" ||
@@ -5133,6 +5176,13 @@ function prepareRefreshSource(
   try {
   const root = join(cleanup, "projection");
   cpSync(sourceRoot, root, { recursive: true, preserveTimestamps: true });
+  // A copy runtime leaves the team's json-entries file out; AI-DLC's part
+  // (root-blocks) stands in for it, so a provider answer lands in that part.
+  for (const integration of descriptor.rootIntegrations) {
+    if (integration.policy !== "json-entries" || pathPresent(join(root, integration.path))) continue;
+    const part = rootBlockPath(join(root, descriptor.harnessDir), integration);
+    if (regularFile(part)) cpSync(part, join(root, integration.path), { preserveTimestamps: true });
+  }
   // A project's own tree holds the team's AGENTS.md or .gitignore
   // with AI-DLC's part merged in, markers and all; the staged release takes
   // AI-DLC's part alone from root-blocks, so a refresh never wraps that part
@@ -7888,6 +7938,15 @@ function holdsShippedServers(projectDir: string, descriptor: Pick<ProjectionDesc
   return false;
 }
 
+// Two JSON texts with the same value, byte order mark and layout aside.
+function sameJsonText(left: string, right: string): boolean {
+  try {
+    return canonical(JSON.parse(withoutBom(left))) === canonical(JSON.parse(withoutBom(right)));
+  } catch {
+    return false;
+  }
+}
+
 function planRootIntegrations(
   projectDir: string,
   sourceRoot: string,
@@ -8269,6 +8328,51 @@ function planRootIntegrations(
       }
       continue;
     }
+    if (integration.policy === "json-entries") {
+      // A team's own JSON file (opencode.json): AI-DLC adds its entries that
+      // are absent, follows the ones it wrote while nobody changed them, and
+      // removes only those it no longer ships. The team's keys, values,
+      // comments, and layout stay as they are.
+      const shippedText = readFileSync(sourcePath, "utf-8");
+      const legacy = integration.legacySignatures?.wholeFileHashes ?? [];
+      const currentHash = sha256Bytes(current);
+      const bareHash = sha256Bytes(withoutBom(current));
+      const legacyMatch = legacy.includes(currentHash) || legacy.includes(bareHash);
+      let ownership: JsonEntriesOwnership;
+      if (priorContribution?.policy === "json-entries") {
+        ownership = { kind: "recorded", entries: priorContribution.entries };
+      } else if (priorContribution?.policy === "whole-file") {
+        // A file AI-DLC wrote whole: still as written, or edited since.
+        ownership = priorContribution.hash === currentHash || priorContribution.hash === bareHash || legacyMatch
+          ? { kind: "whole" }
+          : { kind: "matching" };
+      } else {
+        ownership = legacyMatch || sameJsonText(current, shippedText) ? { kind: "whole" } : { kind: "none" };
+      }
+      const merged = mergeJsonEntries(current, shippedText, ownership, force);
+      if ("conflict" in merged) {
+        actions.push({ path: integration.path, action: "conflict", detail: merged.conflict });
+        continue;
+      }
+      const created = !targetExists || priorContribution?.policy === "whole-file" ||
+        (priorContribution?.policy === "json-entries" && priorContribution.created === true);
+      contributions[integration.path] = {
+        policy: "json-entries",
+        entries: merged.entries,
+        ...(created ? { created: true } : {}),
+      };
+      if (merged.text === current) {
+        actions.push({ path: integration.path, action: "preserve" });
+      } else {
+        operations.push(writeOperation(integration.path, merged.text, expected(targetPath)));
+        actions.push({
+          path: integration.path,
+          action: !targetExists ? "create" : merged.whole ? "update" : "merge",
+          detail: legacyMatch && priorContribution?.policy !== "json-entries" ? "adopted exact legacy signature" : undefined,
+        });
+      }
+      continue;
+    }
     if (integration.policy === "json-array") {
       let targetValue: unknown;
       let sourceValue: unknown;
@@ -8466,6 +8570,22 @@ function planRemovedRootIntegrations(
       } else {
         operations.push(writeOperation(path, value, expected(targetPath)));
         actions.push({ path, action: "merge", detail: "removed retired settings" });
+      }
+      continue;
+    }
+    if (contribution.policy === "json-entries") {
+      // Remove only the entries AI-DLC wrote and nobody has changed since.
+      const value = removeJsonEntries(text, contribution.entries, force);
+      if (value === null) {
+        actions.push({ path, action: "conflict", detail: "retired JSON integration is malformed" });
+      } else if (value === text) {
+        actions.push({ path, action: "preserve", detail: "retired entries were changed or already removed" });
+      } else if (contribution.created && emptyJsonObject(value)) {
+        operations.push({ kind: "remove", path, expected: expected(targetPath) });
+        actions.push({ path, action: "remove", detail: NO_LONGER_SHIPPED });
+      } else {
+        operations.push(writeOperation(path, value, expected(targetPath)));
+        actions.push({ path, action: "merge", detail: "removed retired JSON entries" });
       }
       continue;
     }
@@ -9860,6 +9980,83 @@ function recordBypassesOnly(
   }
 }
 
+// `config --show [--json]`: each section's own `--show`, in CONFIG_SECTIONS
+// order, run in this process with its output gathered, so every block is
+// exactly what that section prints. A section that cannot answer here (no
+// installed harness yet) answers with its own message, and the read still
+// succeeds: agents run this first for "show my settings".
+async function showEverySection(
+  argv: readonly string[],
+  options: ReturnType<typeof globalOptions>,
+  internal: ConfigMainInternal,
+): Promise<void> {
+  const projectDir = valueAfter(argv, "--project-dir");
+  const shared = [
+    ...(projectDir === undefined ? [] : ["--project-dir", projectDir]),
+    ...(argv.includes("--no-color") ? ["--no-color"] : []),
+    ...(options.mode === "json" ? ["--json"] : []),
+  ];
+  const answers: Array<{ section: string; stdout: string; output: string; code: number }> = [];
+  for (const section of CONFIG_SECTIONS) {
+    answers.push({ section, ...(await gatherConfigOutput([section, "--show", ...shared], internal)) });
+  }
+  if (options.mode === "json") {
+    const sections = Object.fromEntries(answers.map(({ section, stdout, code }) => {
+      try {
+        return [section, JSON.parse(stdout) as unknown];
+      } catch {
+        return [section, { ok: false, code, status: "failed", message: stdout.trim() }];
+      }
+    }));
+    emitResult(success("settings for every config section", { sections }), options);
+    return;
+  }
+  process.stdout.write(
+    answers.map(({ section, output }) => `${heading(section, process.stdout)}\n${output.replace(/\n*$/, "\n")}`)
+      .join("\n"),
+  );
+  process.exitCode = EXIT.ok;
+}
+
+// Runs one config command in this process and hands back what it printed
+// (stdout alone, and both streams in order) and its exit code, leaving the
+// caller's exit code as it was.
+async function gatherConfigOutput(
+  args: string[],
+  internal: ConfigMainInternal,
+): Promise<{ stdout: string; output: string; code: number }> {
+  const stdout: string[] = [];
+  const output: string[] = [];
+  const text = (chunk: unknown): string =>
+    typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf-8");
+  const gather = (toStdout: boolean) =>
+    ((chunk: unknown, ...rest: unknown[]) => {
+      if (toStdout) stdout.push(text(chunk));
+      output.push(text(chunk));
+      const done = rest.find((item) => typeof item === "function") as (() => void) | undefined;
+      done?.();
+      return true;
+    }) as typeof process.stdout.write;
+  const stdoutWrite = process.stdout.write;
+  const stderrWrite = process.stderr.write;
+  const exitCode = process.exitCode;
+  process.exitCode = undefined;
+  process.stdout.write = gather(true);
+  process.stderr.write = gather(false);
+  try {
+    await main(args, internal);
+  } catch (error) {
+    output.push(`error: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = EXIT.failure;
+  } finally {
+    process.stdout.write = stdoutWrite;
+    process.stderr.write = stderrWrite;
+  }
+  const code = typeof process.exitCode === "number" ? process.exitCode : EXIT.ok;
+  process.exitCode = exitCode;
+  return { stdout: stdout.join(""), output: output.join(""), code };
+}
+
 export async function main(
   input: string[],
   internal: ConfigMainInternal = {},
@@ -9926,6 +10123,10 @@ export async function main(
     const validation = validateRootConfigArgs(argv);
     if (validation) {
       emitResult(usage(validation, configCommand("--help")), options);
+      return;
+    }
+    if (argv.includes("--show") && !argv.includes("--help")) {
+      await showEverySection(argv, options, internal);
       return;
     }
   }

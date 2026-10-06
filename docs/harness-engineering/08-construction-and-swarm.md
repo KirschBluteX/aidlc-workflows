@@ -66,8 +66,8 @@ Before presenting the command, write it to
 (Write/edit), never a shell `echo` or heredoc. Repo-derived command text must never
 be interpolated into a shell line, where substitutions could run before approval.
 Use `--command-file verification-command.txt` for `log decision`,
-`log answer`, and `state set-construction-verification-command`; use the invoking
-SessionStart session ID for both log calls via `--session "<session ID>"`. Copy the
+`log answer`, and `state set-construction-verification-command`; both log calls
+find their own session, so pass no `--session` and never look one up. Copy the
 complete canonical command exactly from the `command` field in the `decision`
 tool's JSON output into the verification-command question's code span; never
 abbreviate it. Choose a delimiter that preserves any command backticks. The human
@@ -145,15 +145,15 @@ always needs the human; ordinary Units follow `human_required`.
 `swarm_checkpoint` similarly routes a completed batch before the next batch.
 Only after `verify` reports `verified: true` and the current checkpoint has
 `ready: true`, open the human Unit/skeleton approval question with
-`aidlc engine bolt checkpoint --action ask --unit "<unit>" --kind <unit|skeleton> --session "<session ID>"`;
+`aidlc engine bolt checkpoint --action ask --unit "<unit>" --kind <unit|skeleton>`;
 `ask` refuses an unready or unverified checkpoint. For a human batch question,
 only after status reports `ready: true`, run
-`aidlc engine bolt swarm-checkpoint --action ask --batch <N> --units "<Units>" --session "<session ID>"`.
+`aidlc engine bolt swarm-checkpoint --action ask --batch <N> --units "<Units>"`.
 Then present **Approve** / **Request Changes** and wait. The human's exact reply
 in that session, to this checkpoint question, authorizes the matching action;
 an unrelated reply, another session's reply, or a reply to a different question
-does not. Pass that same `--session` on approval/rejection and never pass
-`--user-input` the human did not choose. Consent is one-shot and bound to the
+does not. These commands find their own session; never pass `--user-input`
+the human did not choose. Consent is one-shot and bound to the
 current checkpoint fingerprint, verification proof ID, and authorized command
 digest (batch questions bind the fingerprint and per-Unit `Command SHA-256` set).
 Re-running `verify` or swarm `finalize` withdraws every open checkpoint question

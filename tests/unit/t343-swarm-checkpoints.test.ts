@@ -943,7 +943,7 @@ if (invalid.ok) throw new Error("invalid manifest unexpectedly accepted");
     const asked = tool(pd, "bolt", ["swarm-checkpoint", "--action", "ask", "--batch", "1", "--units", BATCH.join(","), "--session", "t343-checkpoint"]);
     expect(asked.code, asked.out).toBe(0);
     expect(JSON.parse(asked.stdout).notices).toEqual([
-      "Files from unit alpha changed after its batch was checked: src/alpha.ts. Kept them.",
+      "Files from the alpha Unit changed after its batch was checked: src/alpha.ts. Kept them.",
     ]);
     const accepted = readAuditShardEvents(pd).filter((row) => row.event === "CHANGE_ACCEPTED");
     expect(accepted.map((row) => auditBlockField(row.block, "Checkpoint"))).toEqual(["swarm-batch"]);
@@ -1221,5 +1221,28 @@ describe("t343 a batch checkpoint finds the session it runs in", () => {
     const approved = tool(pd, "bolt", ["swarm-checkpoint", "--action", "approve", ...batch, "--user-input", "Approve"], inSession);
     expect(approved.code, approved.out).toBe(0);
     expect(gates(pd).map((row) => auditBlockField(row.block, "Session"))).toEqual([own]);
+  });
+
+  // With no session to find, the agent retries with the session it asked in,
+  // and the person's recorded reply is never asked for again.
+  test("with no session to find, a recorded batch reply goes through on a retry with --session", () => {
+    const pd = fixture();
+    converge(pd);
+    const named = "t343-named-session";
+    const outside = { AIDLC_SESSION_OVERRIDE: "", AIDLC_SESSION_OVERRIDE_SOURCE: "" };
+    const batch = ["--batch", "1", "--units", BATCH.join(",")];
+    const asked = tool(pd, "bolt", ["swarm-checkpoint", "--action", "ask", ...batch, "--session", named], outside);
+    expect(asked.code, asked.out).toBe(0);
+    choice(pd, named, "Approve");
+    const missed = tool(pd, "bolt", ["swarm-checkpoint", "--action", "approve", ...batch, "--user-input", "Approve"], outside);
+    expect(missed.code).not.toBe(0);
+    expect(missed.out).toContain("Could not tell which session this is.");
+    expect(missed.out).not.toContain("Re-ask");
+    expect(readProtectedResponse(pd, named)).not.toBeNull();
+    const retried = tool(pd, "bolt", [
+      "swarm-checkpoint", "--action", "approve", ...batch, "--user-input", "Approve", "--session", named,
+    ], outside);
+    expect(retried.code, retried.out).toBe(0);
+    expect(gates(pd).map((row) => auditBlockField(row.block, "Session"))).toEqual([named]);
   });
 });

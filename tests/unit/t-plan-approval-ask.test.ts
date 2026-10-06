@@ -2203,6 +2203,8 @@ describe("what the engine names while a plan waits", () => {
     ["a jump to Reverse Engineering", "/aidlc --stage reverse-engineering", ["--stage", "reverse-engineering"]],
     ["a redo of this stage", "/aidlc --stage code-generation", ["--stage", "code-generation"]],
     ["a skip", "/aidlc --skip build-and-test", ["--skip", "build-and-test"]],
+    ["a scope change", "/aidlc --scope feature", ["--scope", "feature"]],
+    ["a setting change", "/aidlc --depth minimal --review advisory", ["--depth", "minimal", "--review", "advisory"]],
     ["new work beside it", "/aidlc --new-intent add a csv export", ["--new-intent", "--scope", "poc", "add a csv export"]],
     ["the resume menu's redo", "redo this stage from the start", null],
   ] as const)("%s: every command the engine names gets through", (_label, typed, args) => {
@@ -2226,6 +2228,52 @@ describe("what the engine names while a plan waits", () => {
       expect(verdict.code, `${command}\n${verdict.stderr}`).toBe(0);
       expect(guardBash(proj, `${command}; printf x > src/a.ts`).code, `${command} with a write`).toBe(2);
     }
+  });
+
+  test("a review the person asks for runs while the plan waits: its request, its own review file and dispatch record, nothing else", () => {
+    const proj = waitingPlan();
+    const request = "bun .claude/tools/aidlc.ts engine log review --stage code-generation --reviewer aidlc-architecture-reviewer-agent --iteration 2";
+    // A move the person asks for: it waits for them to have spoken.
+    expect(guardBash(proj, request).code).toBe(2);
+    reply(proj, "before I approve the plan, have the reviewer look at it again");
+    expect(guardBash(proj, request).code, guardBash(proj, request).stderr).toBe(0);
+    expect(guardBash(proj, `${request} --verdict READY`).code).toBe(0);
+    // The request it records names the reviewer's file.
+    const intents = join(proj, "aidlc", "spaces", "default", "intents");
+    const record = join(intents, readFileSync(join(intents, "active-intent"), "utf-8").trim());
+    const reviewFile = ".aidlc-engine/reviews/code-generation/stage/a1/2.0123456789abcdef0123456789abcdef.review.md";
+    const dispatch = join(record, ".aidlc-engine", "reviewer-dispatch.json");
+    // The path as an agent types it in bash: from the project, with forward
+    // slashes (bash reads a Windows backslash as an escape).
+    const dispatchInShell = dispatch.slice(proj.length + 1).replace(/\\/g, "/");
+    expect(guardWrite(proj, join(record, reviewFile)).code).toBe(2);
+    expect(guardWrite(proj, dispatch).code).toBe(2);
+    appendAuditEntry("REVIEW_REQUESTED", {
+      Stage: "code-generation", Reviewer: "aidlc-architecture-reviewer-agent", Iteration: "2",
+      "Request Id": "review:0123456789abcdef0123456789abcdef", "Review File": reviewFile,
+    }, proj);
+    expect(guardWrite(proj, join(record, reviewFile)).code).toBe(0);
+    expect(guardWrite(proj, dispatch).code).toBe(0);
+    expect(guardBash(proj, `rm ${dispatchInShell}`).code).toBe(0);
+    // Everything else still waits for the plan answer.
+    expect(guardWrite(proj, join(record, ".aidlc-engine", "reviews", "code-generation", "stage", "a1", "3.other.review.md")).code).toBe(2);
+    expect(guardWrite(proj, join(record, "construction", "code-generation", "code-summary.md")).code).toBe(2);
+    expect(guardWrite(proj, join(proj, "src", "slugify.ts")).code).toBe(2);
+    expect(guardBash(proj, `printf x > ${dispatchInShell}; printf x > src/a.ts`).code).toBe(2);
+    // Once the review completes, its files wait again.
+    appendAuditEntry("REVIEW_COMPLETED", {
+      Stage: "code-generation", Reviewer: "aidlc-architecture-reviewer-agent", Iteration: "2", Verdict: "READY",
+      "Request Id": "review:0123456789abcdef0123456789abcdef",
+    }, proj);
+    expect(guardWrite(proj, join(record, reviewFile)).code).toBe(2);
+    expect(guardWrite(proj, dispatch).code).toBe(2);
+    // Audit rows are project text: a Review File outside the reviews folder
+    // never opens a write while the plan waits.
+    appendAuditEntry("REVIEW_REQUESTED", {
+      Stage: "code-generation", Reviewer: "aidlc-architecture-reviewer-agent", Iteration: "3",
+      "Request Id": "review:fedcba9876543210fedcba9876543210", "Review File": "../../../../../src/slugify.ts",
+    }, proj);
+    expect(guardWrite(proj, join(proj, "src", "slugify.ts")).code).toBe(2);
   });
 
   test("a move the person asked for waits for them to have spoken", () => {
@@ -2262,6 +2310,46 @@ describe("what the engine names while a plan waits", () => {
     const said = answer(proj, "Approve Plan", ["--park"]);
     expect(said.code, said.message).toBe(0);
     expect(auditText(proj)).toContain("**Person Reply**: approve the plan, but let's stop there for today");
+  });
+
+  // A scope or setting change asked for while the plan waits, alone or with a
+  // skip: each step the engine names runs, and the plan question is still the
+  // open step, answered with the person's words. A new scope tests the plan
+  // its own way, so its answer names the plan's Testing Contract to render
+  // again first.
+  test.each([
+    ["a scope change", "/aidlc --scope feature", ["--scope", "feature"], false],
+    ["a depth change", "/aidlc --depth minimal", ["--depth", "minimal"], true],
+    ["a review change", "/aidlc --review advisory", ["--review", "advisory"], true],
+    [
+      "a setting change with a skip",
+      "/aidlc --depth minimal --skip feedback-optimization",
+      ["--depth", "minimal", "--skip", "feedback-optimization"],
+      true,
+    ],
+  ] as const)("%s while the plan waits runs, and the plan question stays open", (_label, typed, args, planCurrent) => {
+    const proj = waitingPlan();
+    // The setters read the plan's scope from the installed tree.
+    cpSync(AIDLC_SRC, join(proj, ".claude"), { recursive: true });
+    reply(proj, typed);
+    const named = next(proj, [...args]);
+    const commands = namedCommands(named);
+    expect(commands.length, JSON.stringify(named)).toBeGreaterThan(0);
+    for (const command of commands) {
+      const verdict = guardBash(proj, command);
+      expect(verdict.code, `${command}\n${verdict.stderr}`).toBe(0);
+      runInstalled(proj, command);
+    }
+    expect(planApprovalAskIsOpen(proj)).toBe(true);
+    reply(proj, "approve the plan, but let's stop there for today");
+    const said = answer(proj, "Approve Plan", ["--park"]);
+    expect(said.code, said.message).toBe(0);
+    expect(said.recorded).toBe("approve");
+    if (planCurrent) {
+      expect(auditText(proj)).toContain("**Person Reply**: approve the plan, but let's stop there for today");
+    } else {
+      expect(said.message).toContain("Testing Contract");
+    }
   });
 
   // Only the skip's own write keeps the plan question open: any other change

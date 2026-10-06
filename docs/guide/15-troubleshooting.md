@@ -24,7 +24,7 @@ This chapter covers common issues and their solutions, organized by symptom.
 | Kiro IDE: the agent cites "my memory" and suggests bypassing a check or running a hook by hand | Ignore it and delete that Kiro memory (see [Kiro memories carry old AI-DLC advice](harnesses/kiro-ide.md#kiro-memories-carry-old-ai-dlc-advice)) |
 | State file corrupted | Run `/aidlc --doctor`, compare against state template |
 | Stuck at approval gate | Type your response; use `/aidlc --stage <target>` to jump past it |
-| Kiro IDE: your reply to an approval question is not seen, or commands come back with exit code -1 | Choose **Trust Folder & Continue** when Kiro asks whether you trust this folder (or select **Manage**, then **Trust**, on the Restricted Mode banner), then say carry on; if your next message is still not recorded, `/aidlc --doctor` shows why. In Kiro CLI, quit and start `kiro-cli` again in the folder (see [Kiro IDE hooks not running](#kiro-ide-hooks-not-running)) |
+| Kiro IDE: your reply to an approval question is not seen, or commands come back with exit code -1 | Choose **Trust Folder & Continue** when Kiro asks whether you trust this folder (or select **Manage**, then **Trust**, on the Restricted Mode banner), then run **Developer: Reload Window** from the Command Palette and say carry on; if your next message is still not recorded, `/aidlc --doctor` shows why. In Kiro CLI, quit and start `kiro-cli` again in the folder (see [Kiro IDE hooks not running](#kiro-ide-hooks-not-running)) |
 | Kiro CLI (or a Kiro ACP client): every approval says no human reply has arrived, and restarting does not help | The engine does not match the distribution: `kiro` needs Kiro CLI's v2 engine, `kiro-ide` needs v3 (see [Kiro CLI hooks not running](#kiro-cli-hooks-not-running)) |
 | Context compacted mid-session | Run `/aidlc` to resume from checkpoint |
 | Audit log too large | Leave it where it is: a long project's audit file is large by design, and the engine reads it to know what you approved and finished (see [Audit Log Growing Too Large](#audit-log-growing-too-large)) |
@@ -76,7 +76,8 @@ This chapter covers common issues and their solutions, organized by symptom.
 | `managed block has no ownership baseline` | The block was written by an install that no longer exists or has no baseline, for example a removed harness tree. Review `aidlc config --dry-run --json`, then use `--force` to replace it with the current shipped block (the combined entries for a shared `.gitignore`). |
 | `has no readable projection descriptor` or `has lost its projection descriptor and ownership baseline` | Repair the named installed harness with `aidlc config --harness <name>` before adding another harness. For co-owned blocks, a same-release refresh is allowed when the source declares the block shared and leaves the current block unchanged, matching the sibling's baseline, even when that sibling's descriptor is missing; this allows both missing descriptors to be repaired one harness at a time. Otherwise, a `co-owns AGENTS.md` refusal requires restoring the named sibling's descriptor first; `--force` cannot bypass this guard. A stamped sibling (`aidlc-stamp.json` present) that has lost both its descriptor and its baseline blocks a refresh that would change a non-union managed block with `has lost its projection descriptor and ownership baseline`; restore that sibling first. A same-release refresh that leaves the current block unchanged is still allowed, but `--force` cannot permit a block-changing refresh. Legacy trees without a stamp and without baseline evidence of co-ownership can still be adopted one harness at a time. |
 | `is missing its shipped block copy` | The named harness's install lost `tools/data/root-blocks/<marker>`. Run `aidlc config --harness <name>` to restore it, then rerun the refresh. `--force` writes the block without that harness's entries. |
-| `unowned whole file` from an ordinary `aidlc config` release refresh | Move or merge the existing file manually before refresh. OpenCode's `opencode.json` cannot be claimed with `--force` during release refresh; provider, scope, and model answers instead edit the current file in place and do not conflict with unrelated edits. |
+| `unowned whole file` from an ordinary `aidlc config` release refresh | Move or merge the existing file manually before refresh. OpenCode's `opencode.json` no longer stops here: config adds AI-DLC's entries to your file and keeps everything else in it. |
+| `opencode.json` stops config with `<key> must be a JSON object` or `must be a JSON array` | AI-DLC adds its entries to `skills.paths`, `instructions`, and `permission`; when one of those has another shape (for example `"permission": "ask"`), config changes nothing. Write it as a map or a list (`"permission": { "bash": "ask" }`), then rerun config. |
 | `legacy root integration ambiguous; move or delete the unmarked AI-DLC content` | Reconcile the unmarked AI-DLC content in the named root file (such as `AGENTS.md`), preserving project-owned text, then rerun `aidlc config`. Unmarked `.gitignore` content is preserved and a fresh managed block appended; no rename or deletion is needed, and a rule that hides committed records gets a warning. See [Root Integrations and Ownership](18-install-and-lifecycle.md#root-integrations-and-ownership). |
 | `gitignore is not valid UTF-8` | Back up `.gitignore` and convert it from its current encoding to UTF-8, preserving the ignore patterns, then rerun config. AI-DLC leaves the original bytes untouched when decoding would lose information. |
 | `managed markers are missing, duplicated, or malformed` | Repair the named root file so it has exactly one matching `BEGIN AI-DLC` / `END AI-DLC` pair, or remove the broken AI-DLC block and rerun `aidlc config`. |
@@ -198,10 +199,11 @@ sufficient.
 ### Kiro IDE hooks not running
 
 Kiro IDE runs a folder's hooks only after you allow it to run commands in that
-folder. Until then every command the agent runs comes back with no output and
-exit code -1, so no AI-DLC message can show; the agent gives you the step
-itself. Before your first chat message in the project, doctor warns "AIDLC
-hooks have not run in this project yet"; that is expected.
+folder and then reload the window. Until you allow it, every command the agent
+runs comes back with no output and exit code -1, so no AI-DLC message can show;
+the agent gives you the step itself. Before your first chat message in the
+project, doctor warns "AIDLC hooks have not run in this project yet"; that is
+expected.
 
 Trust only a folder whose contents you know (your own project, or one you have
 checked), because trusting lets the folder's `.kiro` hooks run commands on your
@@ -210,7 +212,9 @@ machine (see [First run](harnesses/kiro-ide.md#first-run)).
 1. Choose **Trust Folder & Continue** when Kiro asks whether you trust this
    folder. If the Restricted Mode banner shows at the top of the window
    instead, select **Manage** on it, then **Trust**.
-2. Say carry on in the same chat. If your next message is still not recorded,
+2. Open the Command Palette (Ctrl+Shift+P, or Cmd+Shift+P on macOS) and run
+   **Developer: Reload Window**. Trust takes effect after the reload.
+3. Say carry on in the chat. If your next message is still not recorded,
    `/aidlc --doctor` shows why.
 
 ### Kiro CLI hooks not running

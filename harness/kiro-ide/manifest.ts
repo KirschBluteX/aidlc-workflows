@@ -50,11 +50,11 @@ const quoted = (paths: readonly string[]) =>
   paths.map((path) => `        - "${path}"`);
 
 // Each persona's shell deny admits what the guard admits that persona, and
-// refuses a risky shell form on any AI-DLC command or `date -u`.
+// refuses a risky shell form on any AI-DLC command.
 const copyShellDeny = new Map<string, string[]>(
   DELEGATION_AGENTS.map((agent) => [agent, [
     ...shellDenyLines(copyChannelDelegateShellDeny(".kiro", agent)),
-    ...riskyFormDenyLines(["bun .kiro/tools/aidlc", "date -u"]),
+    ...riskyFormDenyLines(["bun .kiro/tools/aidlc"]),
   ]]),
 );
 
@@ -92,7 +92,6 @@ function personaFrontmatter(agent: string): string[] {
     // pattern above does not reach. Its engine namespace only: the public
     // verbs that change the machine's install keep asking, as on native.
     `        - "bun .kiro/tools/aidlc.ts engine *"`,
-    `        - "date -u *"`,
     // A read-only version check the personas run before a project's tests;
     // the tests themselves keep asking.
     `        - "bun --version"`,
@@ -122,6 +121,22 @@ function personaFrontmatter(agent: string): string[] {
     `        - "aidlc/spaces/*/intents/*/.aidlc-engine/gate-words/**"`,
   ];
 }
+
+// The one Kiro IDE step for AI-DLC that is not running in this window, word
+// for word wherever it appears (doctor, the refusals, the missed-reply line).
+const KIRO_IDE_TRUST_STEP =
+  "In Kiro IDE, trust this folder: choose Trust Folder & Continue when Kiro asks whether you " +
+  "trust it, or select Manage on the Restricted Mode banner, then Trust. Then run Developer: " +
+  "Reload Window from the Command Palette (Ctrl+Shift+P, or Cmd+Shift+P on macOS), and say " +
+  "carry on.";
+
+// The same step outside Kiro IDE, for Kiro CLI and an ACP client on this tree.
+const KIRO_CLI_ACP_STEP =
+  "In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder. If you drive Kiro from an ACP client, " +
+  "the Kiro IDE guide names what that client must send.";
+
+// The words the agent relays when the person's answer was not recorded.
+const ANSWER_NOT_RECORDED = "Your answer was not recorded, so you don't need to answer again.";
 
 const manifest: HarnessManifest = {
   name: "kiro-ide",
@@ -155,26 +170,39 @@ const manifest: HarnessManifest = {
   // folder it has not been allowed to run commands in. Then every agent
   // command comes back with no output and exit code -1, so no AI-DLC message
   // can run; the agent's step sits in what it reads first (its orchestrator
-  // skill). Another agent in the picker did not stop the hooks. What an ACP
-  // client must send to run hooks is in the Kiro IDE guide.
+  // skill). Trust takes effect only after a window reload: a trusted folder ran
+  // no hook until Developer: Reload Window (measured 2026-10-05 on Kiro IDE
+  // 1.1.14 from the Restricted Mode banner, and on 1.2.4 from both the banner
+  // and Trust Folder & Continue), so every copy of the step names both.
+  // Another agent in the picker did not stop the hooks. What an ACP client
+  // must send to run hooks is in the Kiro IDE guide. The approval refusal
+  // (hooks/aidlc-kiro-adapter.ts) gives a Kiro IDE person the text before
+  // " In Kiro CLI," alone, so that sentence keeps its place and spelling.
   hookActivation: {
-    recovery:
-      "In Kiro IDE, choose Trust Folder & Continue when Kiro asks whether you trust this " +
-      "folder, then say carry on. In Kiro CLI, quit Kiro and start `kiro-cli` again in this " +
-      "folder. If you use an ACP client, the Kiro IDE guide says what it must send for AI-DLC's " +
-      "hooks to run.",
-    // Says what happened and asks for nothing again; it adds no step to the
-    // refusal it joins.
+    recovery: `${KIRO_IDE_TRUST_STEP} ${KIRO_CLI_ACP_STEP}`,
+    // Says what happened, asks for nothing again, and gives the person the step
+    // for the tool they are in, in fixed words the agent relays without
+    // explaining why. Inside Kiro IDE (VSCODE_IPC_HOOK or VSCODE_PID set, the
+    // adapter's own signal) that is the Kiro IDE step alone; elsewhere Kiro
+    // CLI and an ACP client, which nothing tells apart, each get their line.
     missedReply:
-      "If the person already replied, that reply was not recorded. Do not ask them to answer " +
-      "again. Tell them that, and that `/aidlc --doctor` shows whether AI-DLC's hooks run in " +
-      "this window.",
+      "If the person already replied, that reply was not recorded. Do not ask them to answer again. " +
+      "Tell them exactly this, with nothing about why, then only the line below for the tool they are in: " +
+      `"${ANSWER_NOT_RECORDED}" ${KIRO_CLI_ACP_STEP}`,
+    missedReplyInHost: {
+      env: ["VSCODE_IPC_HOOK", "VSCODE_PID"],
+      text:
+        "If the person already replied, that reply was not recorded. Do not ask them to answer again. " +
+        `Tell them exactly this, with nothing about why: "${ANSWER_NOT_RECORDED} ${KIRO_IDE_TRUST_STEP}"`,
+    },
     // hooks/aidlc-kiro-adapter.ts leaves a heartbeat on every chat message
     // before the first workflow, so doctor warns only while none exists.
     notRunYet:
-      "This is expected before your first chat message here. If you already sent one, choose " +
-      "Trust Folder & Continue when Kiro asks whether you trust this folder, then send a message " +
-      "and run doctor again. In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder.",
+      "This is expected before your first chat message here. If you already sent one, trust this " +
+      "folder in Kiro IDE: choose Trust Folder & Continue when Kiro asks whether you trust it, or " +
+      "select Manage on the Restricted Mode banner, then Trust. Then run Developer: Reload Window " +
+      "from the Command Palette (Ctrl+Shift+P, or Cmd+Shift+P on macOS), send a message and run " +
+      "doctor again. In Kiro CLI, quit Kiro and start `kiro-cli` again in this folder.",
   },
   harnessDir: ".kiro",
   orchestratorSkillPath: ".kiro/skills/aidlc/SKILL.md",
@@ -304,7 +332,7 @@ const manifest: HarnessManifest = {
       from,
       to: [
         ...shellDenyLines(nativeDelegateShellDeny(agent)),
-        ...riskyFormDenyLines(["aidlc", "date -u"]),
+        ...riskyFormDenyLines(["aidlc"]),
       ].join("\n"),
     })),
 

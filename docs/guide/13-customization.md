@@ -186,8 +186,10 @@ The typed forms `/aidlc config set guard-policy relaxed --intent <name> --space 
 and `/aidlc --guard-policy relaxed --intent <name> --space <name> ...` make the
 human-turn hook apply the switch at prompt time to that intent and space.
 The trailing `...` in the flags form stands for an optional task description.
-A nonexistent named intent is refused; without a state file, create the piece
-of work and type the switch again.
+A nonexistent named intent is refused. Without a state file, Guard Policy
+`relaxed` or `off` and plan approval `off` are kept for the piece of work this
+chat starts next, and any other fence switch says to create the piece of work
+and type it again.
 
 Selectors target the same intent for state, memory policy, and audit without
 switching the active cursors. All supplied values are validated before mutation;
@@ -236,13 +238,15 @@ Precedence is global kill switch (`1`) → valid intent field → scope default 
 `on`. Kill switches can also be recorded with `aidlc config flags --bypass <NAME>`.
 New intents store `Sensors`, `Learnings`, `Summary Confirmation`,
 `Plan Approval`, and `Collaborators` after `Guard Policy` in `aidlc-state.md`, each with a source
-label such as `on (from scope classic)`. The label reads `set by you` only when
+label such as `on (from scope classic)`. For a plan composed for this piece of work, `--status` shows that label as `(from the approved plan)`; the state file keeps the scope. The label reads `set by you` only when
 the human-turn hook applies the message you typed itself: summary confirmation
 or plan approval off typed with no description, plan approval off in your own
 words, or a Guard Policy or fence switch, together with the settings typed
-beside it. Any other change, including a flag on the command
-that starts new work, is made by a command the agent or a script runs and reads
-`set by a command`. A change to work already under way records `CEREMONY_SET`
+beside it. Sensors, learnings or summary confirmation you type with a request
+(`/aidlc --learnings on build the export`), or before any work exists, also
+read `set by you` on the work that request creates. Any other change, including
+a flag the agent adds to the command that starts new work, is made by a command
+the agent or a script runs and reads `set by a command`. A change to work already under way records `CEREMONY_SET`
 either way; a flag on the command that starts new work is stored in the new
 state file without one. Turning summary
 confirmation or plan approval off for work already under way needs your own
@@ -431,9 +435,9 @@ A fence is a guard that refuses an action nothing asked for: no step the workflo
 /aidlc config set guard.review-freeze on
 ```
 
-Lowering a fence or the policy word is the person's call. Ask in your own words and the agent runs the setter (asking for the guards as a whole to be off, such as "turn the guards off", sets Guard Policy `off`), or type `/aidlc config set guard.<fence> off`, `/aidlc --guard-policy relaxed|off`, or the confirmation words `guard policy relaxed|off`, choosing one value. The human-turn hook applies a typed switch at prompt time to the piece of work selected by `--intent <name>` and `--space <name>`, or by the hook payload session's workflow selection when those selectors are omitted, and writes the state and audit row. It reports `AIDLC Guard Policy: ...` as hook context on harnesses that inject it. A nonexistent named intent is refused. A Guard Policy `relaxed` or `off` switch typed before the work exists is for the piece of work this chat starts next (`Guard Policy relaxed for the piece of work you start now (set by you).`). Typed in the same message as a request, it goes with that request (`Guard Policy relaxed for the work you are asking for (set by you).`): new work takes it when it is created, and if you choose to continue the open work instead, it is applied there; the message alone never changes the open work. For a fence switch without a state file, create the piece of work and type the switch again. No other switch is saved for later, and an unrelated reply opens nothing.
+Lowering a fence or the policy word is the person's call. Ask in your own words and the agent runs the setter (asking for the guards as a whole to be off, such as "turn the guards off", sets Guard Policy `off`), or type `/aidlc config set guard.<fence> off`, `/aidlc --guard-policy relaxed|off`, or the confirmation words `guard policy relaxed|off`, choosing one value. The human-turn hook applies a typed switch at prompt time to the piece of work selected by `--intent <name>` and `--space <name>`, or by the hook payload session's workflow selection when those selectors are omitted, and writes the state and audit row. It reports `AIDLC Guard Policy: ...` as hook context on harnesses that inject it. A nonexistent named intent is refused. A Guard Policy `relaxed` or `off` switch typed before the work exists is for the piece of work this chat starts next (`Guard Policy relaxed for the piece of work you start now (set by you).`). Typed in the same message as a request, it goes with that request (`Guard Policy relaxed for the work you are asking for (set by you).`): new work takes it when it is created, and if you choose to continue the open work instead, it is applied there; the message alone never changes the open work. The one exception is while the code plan question is open and you are not editing the plan files: then a setting typed with words (`/aidlc --guard-policy off approve the plan`, or `strict` with your choice) is for this work, and the words are your reply to that question. Words after an unquoted `--` still describe new work. Plan approval `off` typed before the work exists is kept the same way; for any other fence switch without a state file, create the piece of work and type the switch again. No other switch is saved for later, and an unrelated reply opens nothing.
 
-The CLI setters lower only when a reply from you has arrived since the last decision, and perform no switch-authority session lookup. Hooks run on Windows too, so the typed switch works on every harness that forwards the prompt. An already-off fence or an identical policy word already marked `set by you` needs no key because the CLI update is a no-op.
+The CLI setters lower only when a reply from you has arrived since the last decision, and perform no switch-authority session lookup. An approval you give in the same message leaves the rest of it standing: "approve, and turn plan approval off" approves, then turns it off. Any other decision recorded after your message uses it up, and an approval always needs its own reply. Hooks run on Windows too, so the typed switch works on every harness that forwards the prompt. An already-off fence or an identical policy word already marked `set by you` needs no key because the CLI update is a no-op.
 
 When a guard question offers "turn the check off for this piece of work", choosing it is enough: the agent turns it off for you and says in one line that it is off for this piece of work, comes back on for the next one, and that you can ask to turn it back on. On Codex the skill is `$aidlc`.
 
@@ -570,13 +574,12 @@ The `permissions.allow` list in `.claude/settings.json` pre-approves Claude Code
     "Bash(bun .claude/tools/aidlc.ts doctor)", "Bash(bun .claude/tools/aidlc.ts --doctor)",
     "Bash(bun .claude/tools/aidlc.ts config models --show --json)", "...",
     "Bash(bun .claude/tools/aidlc-log.ts)", "Bash(bun .claude/tools/aidlc-log.ts *)", "...",
-    "Bash(date -u *)",
     "Task", "WebSearch"
   ]
 }
 ```
 
-`Edit(/**)` covers creating and changing files anywhere in the project: in project settings Claude Code anchors a leading `/` at the project root. Writes outside the project ask, as they do in Claude Code by default. Reading and searching inside the project needs no entry. The copy channel pre-approves only AI-DLC's own workflow commands, each listed as AI-DLC runs it: its engine commands, `doctor`, `version`, `--doctor`, `status`, the read-only `config <section> --show --json` and `--help` forms, and its `aidlc-*.ts` tools; the native release rewrites them to `Bash(aidlc engine *)`. A `config` change, the commands that change the machine's AI-DLC install (`use`, `update`, `rollback`, `uninstall`, `system`), and the tool scripts behind them match no entry, so you approve them in Claude Code's own prompt. `Bash(date -u *)` covers the timestamps the protocol asks the conductor to take. There is no bare `Bash`: Claude Code matches every subcommand of a compound command on its own and strips only a fixed set of known-safe environment variables, so an engine command stays pre-approved only when it runs bare. A `cd ... &&` prefix, an absolute `$CLAUDE_PROJECT_DIR` path, a `VAR=1` prefix, a pipe into `jq`, or a `$(...)` capture all prompt. A project's own build and test commands sit outside the list and prompt once; answering "Yes, and don't ask again" saves a rule for them in `.claude/settings.local.json`.
+`Edit(/**)` covers creating and changing files anywhere in the project: in project settings Claude Code anchors a leading `/` at the project root. Writes outside the project ask, as they do in Claude Code by default. Reading and searching inside the project needs no entry. The copy channel pre-approves only AI-DLC's own workflow commands, each listed as AI-DLC runs it: its engine commands, `doctor`, `version`, `--doctor`, `status`, the read-only `config <section> --show --json` and `--help` forms, and its `aidlc-*.ts` tools; the native release rewrites them to `Bash(aidlc engine *)`. A `config` change, the commands that change the machine's AI-DLC install (`use`, `update`, `rollback`, `uninstall`, `system`), and the tool scripts behind them match no entry, so you approve them in Claude Code's own prompt. There is no bare `Bash`: Claude Code matches every subcommand of a compound command on its own and strips only a fixed set of known-safe environment variables, so an engine command stays pre-approved only when it runs bare. A `cd ... &&` prefix, an absolute `$CLAUDE_PROJECT_DIR` path, a `VAR=1` prefix, a pipe into `jq`, or a `$(...)` capture all prompt. A project's own build and test commands sit outside the list and prompt once; answering "Yes, and don't ask again" saves a rule for them in `.claude/settings.local.json`.
 
 ### How permissions work
 

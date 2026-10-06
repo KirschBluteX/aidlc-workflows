@@ -90,6 +90,7 @@ import {
   writeOperation,
 } from "../../core/tools/aidlc-transaction.ts";
 import { AIDLC_VERSION } from "../../core/tools/aidlc-version.ts";
+import { copyChannelDispatcherCommands } from "../../core/tools/aidlc.ts";
 import { doctorCommandLines, vscodeVisibleOutput } from "../harness/vscode-output-trim.ts";
 import {
   recoverWindowsUninstallContinuations,
@@ -3006,6 +3007,27 @@ describe("t243 project initialization", () => {
   test("--force cannot overwrite an unowned whole-file root integration", () => {
     const project = temp("aidlc-t240-whole-file-");
     mkdirSync(join(project, ".git"));
+    const config = join(project, "install.ts");
+    writeFileSync(config, "// the project's own install script\n");
+    const initialized = run(INIT, [
+      "config",
+      "--project-dir",
+      project,
+      "--from",
+      CURSOR_RELEASE,
+      "--harness",
+      "cursor",
+      "--force",
+    ], project);
+    expect(initialized.status).toBe(4);
+    expect(initialized.stdout).toContain("unowned whole file");
+    expect(readFileSync(config, "utf-8")).toBe("// the project's own install script\n");
+    expect(existsSync(join(project, ".cursor"))).toBe(false);
+  });
+
+  test("--force keeps the team's own entries in opencode.json", () => {
+    const project = temp("aidlc-t240-json-entries-");
+    mkdirSync(join(project, ".git"));
     const config = join(project, "opencode.json");
     writeFileSync(config, '{"userOwned":true}\n');
     const initialized = run(INIT, [
@@ -3018,10 +3040,10 @@ describe("t243 project initialization", () => {
       "opencode",
       "--force",
     ], project);
-    expect(initialized.status).toBe(4);
-    expect(initialized.stdout).toContain("unowned whole file");
-    expect(readFileSync(config, "utf-8")).toBe('{"userOwned":true}\n');
-    expect(existsSync(join(project, ".aidlc"))).toBe(false);
+    expect(initialized.status, initialized.stdout + initialized.stderr).toBe(0);
+    const value = JSON.parse(readFileSync(config, "utf-8"));
+    expect(value.userOwned).toBe(true);
+    expect(value.skills).toEqual({ paths: [".aidlc/skills"] });
   });
 
   test("dry-run against a missing explicit target creates no directory", () => {
@@ -7952,6 +7974,8 @@ describe("t243 projection channel", () => {
         "opencode.json": [
           "sha256:3be60b2be72b7a423fdaa90fd7d0d9d19613875c05ad5f1a2b6e20fcb54cd1e5",
           "sha256:bc216975f2d614214fc6b6cc612c78f7da3f2b3f56492f0c252297fdc51fb928",
+          "sha256:d8118ed1ea8d76b2b89c55fdf87bc0405325c03c2f72fee5dd689c59fc745a78",
+          "sha256:34904172eae6868a8bcf99cddab1b17639d98d022cb32339a5a05c5b2d096ba1",
         ],
       },
       copilot: {
@@ -8058,9 +8082,12 @@ describe("t243 projection channel", () => {
     expect(claudeSettings.permissions.allow).toContain(`Bash(${trustedCommand("*")})`);
     expect(claudeSettings.permissions.allow).not.toContain("Bash");
     expect(claudeSettings.permissions.allow.some((entry) => entry.startsWith("Bash(bun "))).toBe(false);
+    // The engine prefix, then each read-only and turn-back-on command exactly
+    // as the installed aidlc command runs it.
+    const exactNative = copyChannelDispatcherCommands().map((command) => `aidlc ${command}`);
     expect(
       claudeSettings.permissions.allow.filter((entry) => entry.includes("aidlc")),
-    ).toEqual([`Bash(${trustedCommand("*")})`]);
+    ).toEqual([`Bash(${trustedCommand("*")})`, ...exactNative.map((command) => `Bash(${command})`)]);
     for (const namespace of UNTRUSTED_ROUTE_NAMESPACES) {
       expect(
         claudeSettings.permissions.allow.some((entry) =>
@@ -8082,7 +8109,10 @@ describe("t243 projection channel", () => {
         expect(allowed).toContain(trustedCommand(".*"));
         expect(allowed.some((command) => command.startsWith("bun "))).toBe(false);
         expect(allowed.filter((command) => command.includes("aidlc")))
-          .toEqual([trustedCommand(".*")]);
+          .toEqual([
+            trustedCommand(".*"),
+            ...exactNative.map((command) => command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+          ]);
         for (const namespace of UNTRUSTED_ROUTE_NAMESPACES) {
           expect(allowed.some((command) => command.includes(`aidlc ${namespace}`))).toBe(false);
         }
@@ -8136,9 +8166,11 @@ describe("t243 projection channel", () => {
       readFileSync(join(CURSOR_RELEASE, ".cursor", "cli.json"), "utf-8"),
     ) as { permissions: { allow: string[] } };
     // Cursor reads the first token as the command base and the rest as an
-    // argument glob.
-    expect(cursorCli.permissions.allow).toEqual(["Shell(aidlc:engine *)"]);
-    expect(cursorCli.permissions.allow).toEqual([cursorTrustedShell()]);
+    // argument glob: the engine prefix, then each exact read-only and
+    // turn-back-on command.
+    const cursorExact = copyChannelDispatcherCommands().map((command) => `Shell(aidlc:${command})`);
+    expect(cursorCli.permissions.allow).toEqual(["Shell(aidlc:engine *)", ...cursorExact]);
+    expect(cursorCli.permissions.allow).toEqual([cursorTrustedShell(), ...cursorExact]);
     expect(cursorCli.permissions.allow).not.toContain("Shell(bun)");
     const cursorHooks = readFileSync(
       join(CURSOR_RELEASE, ".cursor", "hooks.json"),

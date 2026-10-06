@@ -45,6 +45,8 @@ import {
   applyReviewOverride,
   CONFIG_KEYS,
   type ConfigKey,
+  ceremoniesCreationGranted,
+  consumeCeremoniesCreationGrant,
   consumeGuardPolicyCreationGrant,
   consumePlanApprovalCreationGrant,
   guardPolicyCreationGranted,
@@ -272,6 +274,7 @@ import {
   type PlanChanges,
   planWithChanges,
   composedPlanLabel,
+  PLAN_NAME_PATTERN,
   splitSlugList,
   readAllAuditShards,
   readAuditShardEvents,
@@ -377,6 +380,8 @@ import {
   normalizeDriveLetter,
   humanPresenceGuardDisabled,
   personSpokeSinceGate,
+  personSaidProjectType,
+  clearProjectTypeAsked,
   recordDir,
   removeRecordFileNoFollow,
   toPosix,
@@ -516,6 +521,7 @@ const INTENT_CREATE_VALUE_FLAGS = [
   "summary-confirmation",
   "skip",
   "add",
+  "plan-name",
   "repos",
   "project-type",
   "space",
@@ -1893,6 +1899,13 @@ To get started:
   const agentLine = agentName === null ? "" : `Active Agent:   ${agentName}\n`;
   const lastLine = lastName === null ? "" : `Last Completed: ${lastName}\n`;
   const nextLine = nextName === null ? "" : `Next Stage:     ${nextName}\n`;
+  const plan = getField(content, PLAN_FIELD);
+  // A plan composed for this work runs on a stock scope the person never
+  // chose, so a setting that came from that scope reads as the approved
+  // plan's. Only the words change: the stored source still names the scope,
+  // which a scope change and plan approval read.
+  const shownSource = (source: string): string =>
+    plan && source === `scope ${scope.trim().toLowerCase()}` ? "the approved plan" : source;
   // Resolved, not the raw line: a memory layer holding strict shows as strict
   // from that file even when the intent's own line says relaxed.
   let guardPolicyDisplay: string;
@@ -1904,7 +1917,7 @@ To get started:
     const resolution = resolveGuardPolicy(projectDir, content, {
       selection: { intent: selection.intent ?? undefined, space: selection.space },
     });
-    guardPolicyDisplay = formatGuardPolicy(resolution.value, resolution.source);
+    guardPolicyDisplay = formatGuardPolicy(resolution.value, shownSource(resolution.source));
     const fences = resolveFences(resolution, content);
     // The plan-approval fence now only decides whether an approved plan that is
     // edited asks again; the Plan Approval line below is the plan stop itself.
@@ -1922,10 +1935,11 @@ To get started:
   }
   const ceremonyDisplay = CEREMONY_KEYS.map((key) => {
     if (key === "plan_approval") {
-      return `${CEREMONY_FIELDS[key]}: ${formatPlanApprovalSetting(resolvePlanApprovalSetting(projectDir, content))}`;
+      const setting = resolvePlanApprovalSetting(projectDir, content);
+      return `${CEREMONY_FIELDS[key]}: ${formatPlanApprovalSetting({ ...setting, source: shownSource(setting.source) })}`;
     }
     const resolution = resolveCeremony(key, scope, content);
-    return `${CEREMONY_FIELDS[key]}: ${formatCeremony(resolution.value, resolution.source)}`;
+    return `${CEREMONY_FIELDS[key]}: ${formatCeremony(resolution.value, shownSource(resolution.source))}`;
   }).join("\n");
 
   // Find current stage number
@@ -2070,7 +2084,6 @@ To get started:
     // Unreadable receipts change nothing the person can act on here.
   }
 
-  const plan = getField(content, PLAN_FIELD);
   // Said only once it is known: workspace detection writes a placeholder first.
   const projectType = declaredProjectType(getField(content, "Project Type") ?? "");
   const projectTypeDisplay = projectType === null
@@ -2084,7 +2097,7 @@ To get started:
   // set for this piece of work.
   const scopeDepth = loadScopeMapping()[scope]?.depth;
   const depthSource = scopeDepth !== undefined && scopeDepth.toLowerCase() === (depth ?? "").toLowerCase()
-    ? `from scope ${scope}`
+    ? (plan ? "from the approved plan" : `from scope ${scope}`)
     : "set for this piece of work";
   const depthDisplay = depth === null
     ? ""
@@ -7624,6 +7637,11 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
     add: splitSlugList(flags.add),
   };
   const composedPlan = planChanges.skip.length > 0 || planChanges.add.length > 0;
+  // The tailored plan's name, as the person saw it at the gate.
+  const planName = flags["plan-name"];
+  if (planName !== undefined && !PLAN_NAME_PATTERN.test(planName)) {
+    die(`--plan-name takes lowercase letters, digits and hyphens; received "${planName}".`);
+  }
   const plannedStages = planWithChanges(scope, planChanges);
   if (plannedStages.errors.length > 0) {
     die(`intent-create refused: ${plannedStages.errors.join(" ")}`);
@@ -7689,6 +7707,15 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
   }
   const ceremonySetByPerson: Partial<Record<CeremonyKey, true>> =
     planApprovalAsked && requestedCeremony.plan_approval === "off" ? { plan_approval: true } : {};
+  // A ceremony the person typed with this request, or before it, at the value
+  // the creation sets: their words, so the work says they set it.
+  const ceremoniesAsked = ceremoniesCreationGranted(projectDir, initialSelection.sessionId, questionId ?? null);
+  consumeCeremoniesCreationGrant(projectDir, initialSelection.sessionId);
+  for (const key of CEREMONY_KEYS) {
+    if (key !== "plan_approval" && requestedCeremony[key] !== undefined && requestedCeremony[key] === ceremoniesAsked[key]) {
+      ceremonySetByPerson[key] = true;
+    }
+  }
   if (requestedCeremony.plan_approval === "off") {
     if (preflightMemoryStrict !== null) die(planApprovalMemoryLockRefusal(preflightMemoryStrict.path));
     if (scopeCeremonyDefault("plan_approval", scope) !== "off" && ceremonySetByPerson.plan_approval !== true) {
@@ -7939,7 +7966,7 @@ function handleIntentCreate(projectDir: string, flags: Record<string, string>): 
       ...(repos.length > 0 ? { Repos: repos.join(", ") } : {}),
       ...(composedPlan
         ? {
-            [PLAN_FIELD]: composedPlanLabel(scope),
+            [PLAN_FIELD]: composedPlanLabel(planName),
             "Stages skipped": planChanges.skip.join(", ") || "none",
             "Stages added": planChanges.add.join(", ") || "none",
           }
@@ -8265,7 +8292,7 @@ function handleIntentCreateStateBuild(
 - **Project Type**: ${projectType}
 - **${PROJECT_TYPE_SOURCE_FIELD}**: ${projectTypeSource}
 - **Scope**: ${scope}
-${composedPlan ? `- **${PLAN_FIELD}**: ${composedPlanLabel(scope)}\n` : ""}- **Start Date**: ${ts}
+${composedPlan ? `- **${PLAN_FIELD}**: ${composedPlanLabel(flags["plan-name"])}\n` : ""}- **Start Date**: ${ts}
 ${flags.request ? `- **Question Id**: ${flags.request}\n` : ""}- **State Version**: ${CURRENT_STATE_VERSION}
 - **Active Agent**: ${firstPostInitAgent}
 - **Worktree Path**:
@@ -8378,7 +8405,7 @@ ${stageProgress}
   process.stdout.write(
     `Intent created: ${createdDir} (space: ${createdSpace})
 State initialized: ${scope} scope, ${totalInScope} stages, ${effectiveDepth} depth
-${composedPlan ? `Plan: ${composedPlanLabel(scope)}, for this piece of work only (no scope file written)\n` : ""}Project type: ${projectType}${declaredType ? " (you said so)" : ""}
+${composedPlan ? `Plan: ${composedPlanLabel(flags["plan-name"])}, for this piece of work only (no scope file written)\n` : ""}Project type: ${projectType}${declaredType ? " (you said so)" : ""}
 ${declaredType === "Brownfield" && scan.projectType !== "Brownfield" ? `${NO_CODE_FOUND_YET}\n` : ""}Languages: ${scan.languages}
 Frameworks: ${scan.frameworks}
 Build System: ${scan.buildSystem}
@@ -10420,8 +10447,8 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
   }
   // What the folder is, is the person's word: it is recorded as theirs only
   // once they have said something since the last decision (an answer to the
-  // question, or the command they typed).
-  if (!humanPresenceGuardDisabled() && !personSpokeSinceGate(projectDir, { requests: true })) {
+  // question, or the command they typed), after the question when it was asked.
+  if (!humanPresenceGuardDisabled() && !personSaidProjectType(projectDir)) {
     die(
       "The person has not said yet whether this folder is existing code. Ask them the question you were given, " +
         "end the turn, and run this command after they answer.",
@@ -10511,6 +10538,7 @@ function handleReclassify(projectDir: string, flags: Record<string, string>, raw
         },
       },
     ], projectDir, intent, space);
+    clearProjectTypeAsked(projectDir);
     if (repos.length > 0 && intent !== undefined) recordDiscoveredRepos(projectDir, intent, repos, space);
     writeStateFile(projectDir, content, intent, space);
 
@@ -11005,7 +11033,14 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       } catch (error) {
         throw new Error(`Cannot record the scope change: ${errorMessage(error)}`);
       }
-      writeStateFile(projectDir, setField(content, "Last Updated", isoTimestamp()), intent, space);
+      const written = setField(content, "Last Updated", isoTimestamp());
+      writeStateFile(projectDir, written, intent, space);
+      // Asked for while the code plan's question waits, it stays the open step.
+      try {
+        keepPlanApprovalAskOverStateWrite(projectDir, contentBefore, written);
+      } catch (e) {
+        recordHookDrop(projectDir, "active-directive", errorMessage(e));
+      }
       // The work list and a restart offer name the scope it runs on now.
       if (intent && oldScope !== newScope) updateIntentScope(projectDir, intent, newScope, space);
     }
@@ -11613,7 +11648,14 @@ function handleConfigChange(projectDir: string, flags: Record<string, string>): 
       // A name-only rename or removal of an agreeing retired line records nothing.
       // Resolving conflicting lines records the prior effective policy instead.
       if (update.audit.length > 0) appendAuditEntries(update.audit, projectDir, intent, space);
-      writeStateFile(projectDir, setField(update.content, "Last Updated", isoTimestamp()), intent, space);
+      const written = setField(update.content, "Last Updated", isoTimestamp());
+      writeStateFile(projectDir, written, intent, space);
+      // Asked for while the code plan's question waits, it stays the open step.
+      try {
+        keepPlanApprovalAskOverStateWrite(projectDir, content, written);
+      } catch (e) {
+        recordHookDrop(projectDir, "active-directive", errorMessage(e));
+      }
     }
     process.stdout.write(`${update.lines.join("\n")}\n`);
   }, intent, space);
@@ -12243,6 +12285,9 @@ export async function main(argv: string[]): Promise<void> {
       break;
     case "version":
       handleVersion();
+      break;
+    case "now":
+      process.stdout.write(`${isoTimestamp()}\n`);
       break;
     case "status":
       handleStatus(projectDir, flags);

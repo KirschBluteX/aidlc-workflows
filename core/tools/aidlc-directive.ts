@@ -254,6 +254,12 @@ export interface RunStageDirective {
   // continues with the readable context; rule-delivery failures are blocking
   // error directives instead.
   context_warnings?: string[];
+  // What the person replied to this stage's questions that no answer holds
+  // yet (a chat that ended before the agent wrote or logged it), in order,
+  // the stage's questions and answers already on record before it, and what
+  // the agent does with it. Present only while the stage's questions file
+  // still has a blank answer.
+  kept_replies?: { answered: Array<{ question: string; answer: string }>; replies: string[]; note: string };
   // gate is a boolean for every deterministic case; the string sentinel
   // GATE_UNRESOLVED ("unresolved") appears ONLY for the first Construction Bolt's
   // walking-skeleton gate, which the conductor resolves via report (the
@@ -502,13 +508,20 @@ interface AskDirectiveBase {
   question: string;
 }
 
+/** One plan the person can name instead: its complete command, and its stage count as the person sees it ("17 of 33 stages"). */
+export interface ScopeCommandRow {
+  scope: string;
+  command: string;
+  stages?: string;
+}
+
 export interface ScopeConfirmAskDirective extends AskDirectiveBase {
   ask_type: "scope-confirm";
   response_route: "next";
   proposed_scope: string;
   confirm_command: string;
   compose_command: string;
-  scope_commands: Array<{ scope: string; command: string }>;
+  scope_commands: ScopeCommandRow[];
   /** The offer's answers as the person sees them, in order: go ahead, then compose. */
   choices: Array<{ label: string; command: string }>;
 }
@@ -517,7 +530,7 @@ export interface ComposeOfferAskDirective extends AskDirectiveBase {
   ask_type: "compose-offer";
   response_route: "next";
   compose_command: string;
-  scope_commands: Array<{ scope: string; command: string }>;
+  scope_commands: ScopeCommandRow[];
 }
 
 export interface IntentPickAskDirective extends AskDirectiveBase {
@@ -560,7 +573,7 @@ export interface NewWorkRoutingAskDirective extends AskDirectiveBase {
   /** Option 2 with the proposed scope. */
   new_intent_command: string;
   /** Option 2 with a human-corrected scope: one complete command per valid scope. */
-  scope_commands: Array<{ scope: string; command: string }>;
+  scope_commands: ScopeCommandRow[];
   /** Option 3, after any required record selection. */
   compose_command: string;
   /** Option 1 for the active workflow the question named; absent when the human selects a record. */
@@ -783,6 +796,7 @@ const RUN_STAGE_FIELDS = [
   "single",
   "inline_context_paths",
   "context_warnings",
+  "kept_replies",
   "gate",
   "unit_gate",
   "construction_policy",
@@ -1132,7 +1146,7 @@ export function validateDirective(obj: unknown): ValidationResult {
         checkString(o, "proposed_scope", kind, errors);
         checkString(o, "confirm_command", kind, errors);
         checkString(o, "compose_command", kind, errors);
-        checkCommandRows(o, "scope_commands", "scope", kind, errors);
+        checkCommandRows(o, "scope_commands", "scope", kind, errors, ["stages"]);
         checkCommandRows(o, "choices", "label", kind, errors);
         rejectUnexpected(
           "scope-confirm",
@@ -1149,7 +1163,7 @@ export function validateDirective(obj: unknown): ValidationResult {
           errors.push(`${kind}: compose-offer response_route must be "next"`);
         }
         checkString(o, "compose_command", kind, errors);
-        checkCommandRows(o, "scope_commands", "scope", kind, errors);
+        checkCommandRows(o, "scope_commands", "scope", kind, errors, ["stages"]);
         rejectUnexpected(
           "compose-offer",
           {
@@ -1196,7 +1210,7 @@ export function validateDirective(obj: unknown): ValidationResult {
         checkString(o, "proposed_scope", kind, errors);
         checkString(o, "numbered_prose_question", kind, errors);
         checkString(o, "new_intent_command", kind, errors);
-        checkCommandRows(o, "scope_commands", "scope", kind, errors);
+        checkCommandRows(o, "scope_commands", "scope", kind, errors, ["stages"]);
         checkString(o, "compose_command", kind, errors);
         if ("available_intents" in o || "select_commands" in o || "reshape_commands" in o) {
           checkStringArray(o, "available_intents", kind, errors);
@@ -1330,6 +1344,7 @@ function checkRunStageShared(
   checkOptionalPipeline(o, kind, errors);
   checkStringArray(o, "inline_context_paths", kind, errors);
   checkOptionalStringArray(o, "context_warnings", kind, errors);
+  checkOptionalKeptReplies(o, kind, errors);
   checkGate(o, "gate", kind, errors);
   checkString(o, "memory_path", kind, errors);
   checkStringArray(o, "consumes", kind, errors);
@@ -1894,6 +1909,30 @@ function checkOptionalPipeline(
   checkStringArray(value, "completed", kind, errors);
 }
 
+function checkOptionalKeptReplies(
+  o: Record<string, unknown>,
+  kind: DirectiveKind,
+  errors: string[],
+): void {
+  if (!("kept_replies" in o)) return;
+  const value = o.kept_replies;
+  if (!isPlainObject(value)) {
+    errors.push(`${kind}: kept_replies must be object, got ${describe(value)}`);
+    return;
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "answered" && key !== "replies" && key !== "note") errors.push(`${kind}: kept_replies unknown key: ${key}`);
+  }
+  const answered = value.answered;
+  if (!Array.isArray(answered) || !answered.every((entry) =>
+    isPlainObject(entry) && typeof entry.question === "string" && typeof entry.answer === "string" &&
+    Object.keys(entry).every((key) => key === "question" || key === "answer"))) {
+    errors.push(`${kind}: kept_replies.answered must be an array of { question, answer } strings`);
+  }
+  checkStringArray(value, "replies", kind, errors);
+  checkString(value, "note", kind, errors);
+}
+
 function checkOptionalTrue(
   o: Record<string, unknown>,
   field: string,
@@ -2331,6 +2370,7 @@ function checkCommandRows(
   key: string,
   kind: DirectiveKind,
   errors: string[],
+  optional: readonly string[] = [],
 ): void {
   if (!(field in o)) {
     errors.push(`${kind}: missing required field: ${field}`);
@@ -2350,8 +2390,10 @@ function checkCommandRows(
       continue;
     }
     for (const rowKey of Object.keys(row)) {
-      if (rowKey !== key && rowKey !== "command") {
+      if (rowKey !== key && rowKey !== "command" && !optional.includes(rowKey)) {
         errors.push(`${kind}: ${field}[${i}] unknown key: ${rowKey}`);
+      } else if (optional.includes(rowKey) && typeof row[rowKey] !== "string") {
+        errors.push(`${kind}: ${field}[${i}].${rowKey} must be string, got ${describe(row[rowKey])}`);
       }
     }
     if (typeof row[key] !== "string") {

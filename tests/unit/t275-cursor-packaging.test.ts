@@ -53,8 +53,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { REPO_ROOT } from "../harness/fixtures.ts";
 import { copyChannelDispatcherCommands, copyChannelToolScripts, machineReachingTools, resolveAction } from "../../core/tools/aidlc.ts";
+import { RECORDABLE_PROJECT_BYPASSES } from "../../core/tools/aidlc-settings.ts";
+import { CONFIG_SECTIONS } from "../../core/tools/aidlc-command.ts";
 
 setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+// Every read form agents were seen running for "show my settings", "what
+// version", "is my setup healthy" and "what is my status", pinned on their own
+// so the list cannot lose one.
+const SEEN_READ_FORMS = [
+  "--status",
+  "--version",
+  "version",
+  "config --help",
+  "doctor",
+  "--doctor",
+  "doctor --verbose",
+  "--doctor --verbose",
+  "config --show",
+  "config --show --json",
+  ...CONFIG_SECTIONS.flatMap((section) => [
+    `config ${section} --show`,
+    `config ${section} --show --json`,
+    `config ${section} --help`,
+  ]),
+];
+
 
 const PACKAGE_SCRIPT = join(REPO_ROOT, "scripts", "package.ts");
 const CLAUDE_SRC = join(REPO_ROOT, "dist", "claude", ".claude");
@@ -274,9 +298,15 @@ describe("t275 dist/cursor packaging parity + shell shape", () => {
       "bun .cursor/tools/aidlc.ts version",
       "bun .cursor/tools/aidlc.ts --doctor",
       "bun .cursor/tools/aidlc.ts status",
+      // The utility spellings agents also use, and config's own help.
+      "bun .cursor/tools/aidlc.ts --status",
+      "bun .cursor/tools/aidlc.ts --version",
+      "bun .cursor/tools/aidlc.ts config --help",
       "bun .cursor/tools/aidlc-utility.ts",
       "bun .cursor/tools/aidlc-utility.ts codekb-path",
       "bun .cursor/tools/aidlc-log.ts answers --stage x",
+      // Turning a recorded check back on, in the one form the skills name.
+      ...RECORDABLE_PROJECT_BYPASSES.map((name) => `bun .cursor/tools/aidlc.ts config flags --clear-bypass ${name} --yes`),
     ]) {
       expect(cursorShellEffect(cli, command), command).toBe("allow");
     }
@@ -292,6 +322,9 @@ describe("t275 dist/cursor packaging parity + shell shape", () => {
       // Any config change, a machine-wide flag however it is spelled included,
       // and a read that only looks like the shipped forms.
       "bun .cursor/tools/aidlc.ts config --pin 2.10.0",
+      // The guided setup, which changes the project.
+      "bun .cursor/tools/aidlc.ts config",
+      "bun .cursor/tools/aidlc.ts config --yes",
       "bun .cursor/tools/aidlc.ts config --unpin",
       "bun .cursor/tools/aidlc.ts config --channel",
       "bun .cursor/tools/aidlc.ts config --channel preview",
@@ -301,11 +334,80 @@ describe("t275 dist/cursor packaging parity + shell shape", () => {
       "bun .cursor/tools/aidlc.ts config models --deciding-effort high --project --yes",
       "bun .cursor/tools/aidlc.ts config models --show --json --global",
       "bun .cursor/tools/aidlc.ts doctor --fix",
+      // Turning a check off, and a form that changes something else as well.
+      "bun .cursor/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --local --yes",
+      "bun .cursor/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes",
+      "bun .cursor/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --bypass AIDLC_DISABLE_SENSORS --yes",
+      "bun .cursor/tools/aidlc.ts config flags --bypass AIDLC_DISABLE_SENSORS --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes",
+      "bun .cursor/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --bypass AIDLC_DISABLE_SENSORS",
+      "bun .cursor/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --question-retention-days 1",
+      "bun .cursor/tools/aidlc.ts config flags --clear-bypass AIDLC_DISABLE_REVIEW_FREEZE_HOOK --yes --global",
+      "bun .cursor/tools/aidlc.ts config flags --clear-bypass AIDLC_NOT_A_SWITCH --yes",
       // A file whose name only starts with a tool script's.
       "bun .cursor/tools/aidlc-log.tsx answers --stage x",
       "bun .cursor/tools/aidlc-log.ts.bak answers --stage x",
     ]) {
       expect(cursorShellEffect(cli, command), command).toBe("ask");
+    }
+  });
+
+  // The native release runs AI-DLC through the installed `aidlc` command. It
+  // pre-approves the engine prefix and, exactly as written, the same read-only
+  // and turn-back-on commands as the copy channel; any change still asks.
+  test("6c: the native release runs the read-only and turn-back-on commands with no prompt; any change asks", () => {
+    const shipped = JSON.parse(readFileSync(join(CURSOR_RELEASE_ROOT, ".cursor", "cli.json"), "utf-8")) as {
+      permissions: { allow: string[]; deny?: string[] };
+    };
+    const cli = { allow: shipped.permissions.allow, deny: shipped.permissions.deny ?? [] };
+    expect(cli.allow.filter((entry) => entry.includes("aidlc"))).toEqual([
+      "Shell(aidlc:engine *)",
+      ...copyChannelDispatcherCommands().map((command) => `Shell(aidlc:${command})`),
+    ]);
+    const check = "AIDLC_DISABLE_REVIEW_FREEZE_HOOK";
+    const copy = { allow: SHIPPED_ALLOW, deny: SHIPPED_DENY };
+    for (const form of SEEN_READ_FORMS) {
+      expect(cursorShellEffect(cli, `aidlc ${form}`), form).toBe("allow");
+      expect(cursorShellEffect(copy, `bun .cursor/tools/aidlc.ts ${form}`), form).toBe("allow");
+    }
+    for (const form of ["config", "config --yes", "--config", "config models --show --global"]) {
+      expect(cursorShellEffect(cli, `aidlc ${form}`), form).not.toBe("allow");
+      expect(cursorShellEffect(copy, `bun .cursor/tools/aidlc.ts ${form}`), form).not.toBe("allow");
+    }
+    for (const command of [
+      "aidlc engine orchestrate next",
+      "aidlc doctor",
+      "aidlc --doctor",
+      "aidlc status",
+      "aidlc --status",
+      "aidlc version",
+      "aidlc --version",
+      "aidlc config --help",
+      "aidlc config models --show --json",
+      "aidlc config flags --help",
+      ...RECORDABLE_PROJECT_BYPASSES.map((name) => `aidlc config flags --clear-bypass ${name} --yes`),
+    ]) {
+      expect(cursorShellEffect(cli, command), command).toBe("allow");
+    }
+    for (const command of [
+      "aidlc config",
+      "aidlc config --yes",
+      "aidlc config --pin 2.10.0",
+      "aidlc config --channel preview",
+      "aidlc config models --show --json --global",
+      "aidlc config models --deciding-effort high --project --yes",
+      `aidlc config flags --bypass ${check} --local --yes`,
+      `aidlc config flags --bypass ${check} --yes`,
+      `aidlc config flags --clear-bypass ${check} --bypass AIDLC_DISABLE_SENSORS --yes`,
+      `aidlc config flags --clear-bypass ${check} --yes --bypass AIDLC_DISABLE_SENSORS`,
+      `aidlc config flags --clear-bypass ${check} --yes --global`,
+      "aidlc config flags --clear-bypass AIDLC_NOT_A_SWITCH --yes",
+      "aidlc doctor --fix",
+      "aidlc update",
+      "aidlc use 2.10.0",
+      "aidlc uninstall --yes",
+      "aidlc system config global set offline on",
+    ]) {
+      expect(cursorShellEffect(cli, command), command).not.toBe("allow");
     }
   });
 

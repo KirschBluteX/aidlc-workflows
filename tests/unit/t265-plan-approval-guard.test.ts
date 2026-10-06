@@ -1522,6 +1522,10 @@ describe("t265b hook lifecycle", () => {
         ["bun .claude/tools/aidlc-doctor.ts doctor --verbose", 0],
         ["aidlc --version", 0],
         ["aidlc status", 0],
+        // The engine's clock, for a time a document asks for.
+        ["aidlc engine now", 0],
+        ["bun .claude/tools/aidlc.ts engine now", 0],
+        ["bun .claude/tools/aidlc-utility.ts now", 0],
         ["aidlc doctor --export --output out", 2],
         ["aidlc doctor --export=bundle", 2],
         ["bun .claude/tools/aidlc-doctor.ts doctor --export=bundle", 2],
@@ -1690,12 +1694,16 @@ describe("t265b hook lifecycle", () => {
       for (const command of [
         "aidlc engine config set guard.review-freeze off --force",
         "aidlc engine config set guard.human-presence off",
-        "aidlc engine config set depth Minimal",
         "aidlc engine config set guard-policy lax",
         "aidlc engine config set guard.review-freeze off; touch src/x.ts",
       ]) {
         expect(code(command), command).toBe(2);
       }
+      // A setting such as depth is not a check: once the person has spoken it
+      // passes as a move they asked for (t-plan-approval-ask), alone.
+      expect(code("aidlc engine config set depth Minimal")).toBe(0);
+      expect(code("aidlc engine config set collaborators off")).toBe(0);
+      expect(code("aidlc engine config set depth Minimal; touch src/x.ts")).toBe(2);
     } finally {
       rmSync(proj, { recursive: true, force: true });
     }

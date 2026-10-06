@@ -103,6 +103,7 @@ import {
   commandTurnHint,
   humanRepliedSinceGate,
   humanPresenceGuardDisabled,
+  memoryStrictHoldsGuardPolicy,
   humanTurnMintAllowed,
   hookActivation,
   personRepliedSincePresentation,
@@ -2162,7 +2163,8 @@ export interface ParkResult {
 function handlePark(_args: string[]): void {
   const pd = resolveProjectDir(projectDir);
   const attendedSession = humanTurnMintAllowed();
-  const replied = attendedSession && personSpokeSinceGate(pd);
+  // Their stop outlives the run's own approvals after it (personSpokeSinceGate).
+  const replied = attendedSession && personSpokeSinceGate(pd, { outlivesApproval: true });
   const activation = hookActivation();
   const missedReply = attendedSession && !replied &&
     (activation?.missedReply !== undefined || activation?.missesReplies === true) &&
@@ -3773,12 +3775,13 @@ function verifyGateOpeningGuards(
   pd: string,
   content: string,
   stage: NonNullable<ReturnType<typeof findStageBySlug>>,
+  personCall?: PersonApproval,
 ): void {
   verifyStageArtifacts(pd, stage, "present-approval-gate");
   verifySummaryConfirmationPrecondition(pd, content, stage);
   verifyPipelineLinkPrecondition(pd, stage);
   if (!reviewerGateGuardDisabled()) {
-    verifyReviewerPrecondition(pd, content, stage, "present-approval-gate");
+    verifyReviewerPrecondition(pd, content, stage, "present-approval-gate", true, personCall);
   }
 }
 
@@ -4143,6 +4146,51 @@ function refuseStateGuard(
   throw new StateGuardRefusalError(refusal, snapshot.attempt, snapshot.resources);
 }
 
+// The person's own approval, carried through the admission chain. It goes over
+// a review the agent asked for that has no verdict yet; the chain sets
+// overUnfinishedReview when it did, so the approval is recorded that way.
+export interface PersonApproval {
+  overUnfinishedReview: boolean;
+}
+
+// Whether the person's approval may go over an unfinished review here. A team
+// that locks Guard Policy strict keeps every review required; asking for the
+// review again always works. The one place that says which lock counts.
+function personMayApproveOverUnfinishedReview(pd: string, content: string): boolean {
+  return !memoryStrictHoldsGuardPolicy(pd, content);
+}
+
+// A review request with no verdict yet that the person may approve over. A
+// recovery review in flight, or a result that could not be verified, still
+// finishes first.
+function approvableUnfinishedReview(
+  pd: string,
+  content: string,
+  receipts: ReturnType<typeof freshReviewReceipts>,
+  personCall: PersonApproval | undefined,
+  unit?: string,
+): boolean {
+  if (personCall === undefined) return false;
+  const pending = unit === undefined ? receipts.stagePending : receipts.unitPending.get(unit);
+  if (
+    receipts.awaitingVerdict?.has(unit ?? "") !== true ||
+    pending === null ||
+    pending === undefined ||
+    pending.recovery ||
+    pending.verificationFailed === true ||
+    !personMayApproveOverUnfinishedReview(pd, content)
+  ) {
+    return false;
+  }
+  personCall.overUnfinishedReview = true;
+  return true;
+}
+
+// The one line the person hears when their approval went over that review.
+function unfinishedReviewNotice(stage: { name: string }, unit?: string): string {
+  return `Approved. The ${stage.name} review${unit ? ` for ${unit}` : ""} did not finish.`;
+}
+
 function verifyReviewerPrecondition(
   pd: string,
   content: string,
@@ -4162,6 +4210,7 @@ function verifyReviewerPrecondition(
   },
   action: ReviewerPreconditionAction = "complete",
   requireReceiptExistence = true,
+  personCall?: PersonApproval,
 ): void {
   if (!stage.reviewer) return; // stage declares no reviewer — nothing to enforce
 
@@ -4367,6 +4416,7 @@ function verifyReviewerPrecondition(
 
   if (!perUnit) {
     if (!sawStageReview) {
+      if (approvableUnfinishedReview(pd, content, receipts, personCall)) return;
       if (receipts.stageStale) {
         staleReviewPreconditionError(
           pd,
@@ -4395,7 +4445,7 @@ function verifyReviewerPrecondition(
   const noDagObserved = resolution.state === "none";
   if (noDagObserved) {
     if (receipts.mergedBoltUnits.size === 0) {
-      if (!sawStageReview) {
+      if (!sawStageReview && !approvableUnfinishedReview(pd, content, receipts, personCall)) {
         reviewerPreconditionError(pd, content, stage, reviewer, receipts, action);
       }
       return;
@@ -4403,7 +4453,7 @@ function verifyReviewerPrecondition(
     if (sawStageReview) return;
     reviewUnits = [...receipts.mergedBoltUnits].sort();
   } else if (resolution.units.length === 0) {
-    if (!sawStageReview) {
+    if (!sawStageReview && !approvableUnfinishedReview(pd, content, receipts, personCall)) {
       reviewerPreconditionError(pd, content, stage, reviewer, receipts, action);
     }
     return;
@@ -4426,7 +4476,9 @@ function verifyReviewerPrecondition(
   }
   if (reviewUnits.length === 0) return;
 
-  const missing = reviewUnits.filter((u) => !reviewedUnits.has(u));
+  const missing = reviewUnits.filter(
+    (u) => !reviewedUnits.has(u) && !approvableUnfinishedReview(pd, content, receipts, personCall, u),
+  );
   if (missing.length > 0) {
     if (noDagObserved) {
       const requestCommands = missing.flatMap((unit) => {
@@ -5474,6 +5526,7 @@ function verifyReviewerPreconditionForUnit(
   stage: NonNullable<ReturnType<typeof findStageBySlug>>,
   unit: string,
   action: ReviewerPreconditionAction,
+  personCall?: PersonApproval,
 ): void {
   if (!stage.reviewer) return;
   const reviewClass = resolveReviewClass(
@@ -5485,7 +5538,7 @@ function verifyReviewerPreconditionForUnit(
   // The same governed checkpoint as the stage-level verifier, for one Unit.
   const receipts = freshReviewReceipts(pd, content, stage, { reviewClass });
   observeChangeControl(pd, content, receipts);
-  if (!receipts.unitVerdicts.has(unit)) {
+  if (!receipts.unitVerdicts.has(unit) && !approvableUnfinishedReview(pd, content, receipts, personCall, unit)) {
     const message =
       `Refusing gate for unit "${unit}" of "${stage.slug}": no fresh ` +
       `REVIEW_COMPLETED receipt from ${stage.reviewer} is recorded for this unit.`;
@@ -5505,6 +5558,7 @@ function verifyTeamUnitGateEvidence(
   content: string,
   context: TeamGateContext,
   action: ReviewerPreconditionAction = "present-approval-gate",
+  personCall?: PersonApproval,
 ): void {
   for (const stage of context.stages) {
     if (applicableUnitProduces(pd, stage, context.unit).length === 0) continue;
@@ -5555,6 +5609,7 @@ function verifyTeamUnitGateEvidence(
       stage,
       context.unit,
       action,
+      personCall,
     );
     if (stage.workspace_requires) verifyStageArtifacts(pd, stage, action);
   }
@@ -5588,6 +5643,8 @@ export type StageAdmissionOptions = {
   action: Exclude<GuardPreflightAction, "review-request">;
   unit?: string;
   entrypoint?: "approve" | "advance" | "finalize" | "complete-workflow";
+  // The person's own approval (gate opening for it, or approve itself).
+  personCall?: PersonApproval;
 };
 
 function verifyConstructionCheckpointPrecondition(
@@ -5648,6 +5705,7 @@ function admitStageAction(
           stateContent,
           team,
           options.action === "complete" ? "complete" : "present-approval-gate",
+          options.personCall,
         );
         if (options.action !== "complete") {
           verifyTeamUnitGatePipelinePrecondition(pd, team);
@@ -5657,7 +5715,7 @@ function admitStageAction(
     }
 
     if (options.action !== "complete") {
-      verifyGateOpeningGuards(pd, stateContent, stage);
+      verifyGateOpeningGuards(pd, stateContent, stage, options.personCall);
       verifyConstructionCheckpointPrecondition(pd, stateContent, stage, options.action);
       return;
     }
@@ -5669,7 +5727,7 @@ function admitStageAction(
       verifyStageArtifacts(pd, stage);
       verifySummaryConfirmationPrecondition(pd, stateContent, stage);
       verifyPipelineLinkPrecondition(pd, stage);
-      verifyReviewerPrecondition(pd, stateContent, stage);
+      verifyReviewerPrecondition(pd, stateContent, stage, "complete", true, options.personCall);
       if (!alreadyCompleted) {
         verifyConstructionCheckpointPrecondition(pd, stateContent, stage, options.action);
       }
@@ -5705,6 +5763,7 @@ export function guardPreflight(
     action: GuardPreflightAction;
     unit?: string;
     entrypoint?: "approve" | "advance" | "finalize" | "complete-workflow";
+    personApproves?: boolean;
   },
 ): GuardPreflightResult {
   if (options.action === "review-request") {
@@ -5719,6 +5778,7 @@ export function guardPreflight(
       action: options.action,
       ...(options.unit !== undefined ? { unit: options.unit } : {}),
       ...(options.entrypoint ? { entrypoint: options.entrypoint } : {}),
+      ...(options.personApproves ? { personCall: { overUnfinishedReview: false } } : {}),
     });
     return { executable: true };
   } catch (error) {
@@ -5761,7 +5821,7 @@ function handleGateStart(args: string[]): void {
   if (args.length < 1) {
     error(
       "Usage: aidlc-state.ts gate-start <slug> [--artifacts <csv>] " +
-        "[--recovered] [--override-blocking-sensors] [--user-input <choice>]",
+        "[--recovered [--person-approves]] [--override-blocking-sensors] [--user-input <choice>]",
     );
   }
   const slug = args[0];
@@ -5792,9 +5852,20 @@ function handleGateStart(args: string[]): void {
       ["in-progress", "awaiting-approval"],
     );
   }
+  // A gate backfilled for the person's own approval (report approved with their
+  // reply) opens for it over a review that never finished. It counts only when
+  // the person replied since the last decision; the agent alone cannot use it.
+  const personApproves =
+    recovered &&
+    args.includes("--person-approves") &&
+    (preflightTeamGate !== null || !isAutonomousConstructionGate(preflightContent, preflightStage, pd)) &&
+    (humanPresenceGuardDisabled() || humanRepliedSinceGate(pd));
+  const personCall = (): PersonApproval | undefined =>
+    personApproves ? { overUnfinishedReview: false } : undefined;
   admitStageAction(pd, preflightContent, preflightStage, {
     action: "present-approval-gate",
     ...(preflightTeamGate ? { unit: preflightTeamGate.unit } : {}),
+    personCall: personCall(),
   });
   const gateSensorEvaluation = fireGateSensors(
     pd,
@@ -5825,6 +5896,7 @@ function handleGateStart(args: string[]): void {
     admitStageAction(pd, content, stage, {
       action: "present-approval-gate",
       unit: teamGate.unit,
+      personCall: personCall(),
     });
     verifyGateSensorArtifactsUnchanged(slug, gateSensorEvaluation);
     const status = unitGateStatus(
@@ -5874,7 +5946,7 @@ function handleGateStart(args: string[]): void {
   }
   validateSlugInState(content, slug, ["in-progress", "awaiting-approval"]);
   const alreadyAwaiting = getSlugState(content, slug) === "awaiting-approval";
-  admitStageAction(pd, content, stage, { action: "present-approval-gate" });
+  admitStageAction(pd, content, stage, { action: "present-approval-gate", personCall: personCall() });
   verifyGateSensorArtifactsUnchanged(slug, gateSensorEvaluation);
   if (alreadyAwaiting) {
     if (
@@ -6048,6 +6120,7 @@ function handleApprove(args: string[]): void {
       action: "complete",
       entrypoint: "approve",
       unit: preflightTeamGate.unit,
+      personCall: { overUnfinishedReview: false },
     });
   } else {
     verifyStageArtifacts(pd, preflightStage);
@@ -6102,10 +6175,13 @@ function handleApprove(args: string[]): void {
   );
 
   if (teamGate) {
+    // A team Unit gate is always the person's to approve (checked above and below).
+    const teamPersonCall: PersonApproval = { overUnfinishedReview: false };
     admitStageAction(pd, content, stage, {
       action: "complete",
       entrypoint: "approve",
       unit: teamGate.unit,
+      personCall: teamPersonCall,
     });
     const reviewFindingDispositions = acceptedRiskDispositionField(
       pd,
@@ -6146,6 +6222,7 @@ function handleApprove(args: string[]): void {
                 reviewFindingDispositions,
             }
           : {}),
+        ...(teamPersonCall.overUnfinishedReview ? { Review: "not finished" } : {}),
       });
     } catch (e) {
       error(`Audit emission failed: ${errorMessage(e)}`);
@@ -6157,6 +6234,9 @@ function handleApprove(args: string[]): void {
       gate_scope: teamGate.scope,
       approved: true,
       timestamp,
+      ...(teamPersonCall.overUnfinishedReview
+        ? { change_notices: [unfinishedReviewNotice(stage, teamGate.unit)] }
+        : {}),
     }));
     return;
   }
@@ -6251,9 +6331,14 @@ function handleApprove(args: string[]): void {
   // The shared admission chain for approve: artifacts and summary again (they
   // ran before the backstop above and are re-read here), then pipeline and
   // reviewer evidence. The router preflights `approve` through the same call.
+  // The person's own approval goes over a review that never finished.
+  const personCall: PersonApproval | undefined = autonomousDecision
+    ? undefined
+    : { overUnfinishedReview: false };
   admitStageAction(pd, content, stage, {
     action: "complete",
     entrypoint: "approve",
+    personCall,
   });
   const reviewFindingDispositions = acceptedRiskDispositionField(pd, stage);
 
@@ -6298,6 +6383,7 @@ function handleApprove(args: string[]): void {
       gateFields[REVIEW_FINDING_DISPOSITIONS_FIELD] =
         reviewFindingDispositions;
     }
+    if (personCall?.overUnfinishedReview) gateFields.Review = "not finished";
     emitAudit(pd, "GATE_APPROVED", gateFields);
 
     emitAudit(pd, "STAGE_COMPLETED", {
@@ -6311,6 +6397,9 @@ function handleApprove(args: string[]): void {
   }
 
   writeStateFile(pd, content);
+  if (personCall?.overUnfinishedReview) {
+    console.log(JSON.stringify({ change_notices: [unfinishedReviewNotice(stage)] }));
+  }
 
   // No explicit consume step (ledger-event design): the GATE_APPROVED
   // emitted by this commit IS the freshness boundary for the next gate. A second

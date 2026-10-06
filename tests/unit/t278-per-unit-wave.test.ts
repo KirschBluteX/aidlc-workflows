@@ -918,7 +918,7 @@ describe("t278 engine-emitted wave contract", () => {
         env: { ...process.env, AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1" },
       });
       expect(opened.status, `${opened.stdout}${opened.stderr}`).toBe(0);
-      expect(`${opened.stdout}`).toContain("changed after Unit alpha's review; carrying on.");
+      expect(`${opened.stdout}`).toContain("The alpha Unit's Functional Design documents changed after they were reviewed; carrying on.");
     }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
   }
 
@@ -1020,9 +1020,14 @@ describe("t278 engine-emitted wave contract", () => {
     expect(frozen.status, frozen.out).toBe(2);
     expect(frozen.out).toContain("Finish the current revision");
     expect(frozen.out).toContain("--result revised");
-    expect(frozen.out).toContain("/aidlc --stage functional-design");
     expect(frozen.out).not.toContain("Request Changes");
     expect(frozen.out).not.toContain("--result rejected");
+    // The recovery question the refusal left is what the next `next` asks.
+    const asked = JSON.stringify(next(proj).directive);
+    expect(asked).toContain('"ask_type":"guard-recovery"');
+    expect(asked).toContain("/aidlc --stage functional-design");
+    expect(asked).not.toContain("Request Changes");
+    expect(asked).not.toContain("--result rejected");
 
     writeFileSync(artifact, "# changed before recovery\n");
     review(proj, "alpha", "READY", 2);
