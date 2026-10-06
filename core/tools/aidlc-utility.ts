@@ -198,6 +198,7 @@ import {
   emitError,
   errorMessage,
   escapeRegex,
+  effectivePlanAction,
   findAllEvents,
   findStageBySlug,
   foreignAgentFiles,
@@ -276,6 +277,10 @@ import {
   splitSlugList,
   readAllAuditShards,
   readAuditShardEvents,
+  resolveBoltDag,
+  unitGateStatus,
+  unitLifecycleSnapshot,
+  unitPlainName,
   recoveryRepoCandidates,
   readActiveDirectiveMarker,
   activeDirectiveOutOfDateReason,
@@ -10708,6 +10713,56 @@ function determineFirstPostInitStage(
 // scope-change — atomically change scope on an existing workflow
 // ---------------------------------------------------------------------------
 
+// Unit work a plan change leaves behind, in one line: a per-Unit Construction
+// stage the old plan ran and the new one does not, where a Unit has an open
+// approval or unfinished work. The change still goes through; the line only
+// says what it dropped. Read from the Unit ledgers, never from the network.
+function droppedUnitWorkLine(
+  projectDir: string,
+  before: string,
+  after: string,
+  intent?: string,
+  space?: string,
+): string | null {
+  const oldScope = getField(before, "Scope");
+  const newScope = getField(after, "Scope");
+  const dropped = loadStageGraph().filter((stage) =>
+    stage.phase === "construction" && isPerUnitStage(stage) &&
+    effectivePlanAction(stage.slug, oldScope, before) === "EXECUTE" &&
+    effectivePlanAction(stage.slug, newScope, after) !== "EXECUTE");
+  if (dropped.length === 0) return null;
+  let rows: ReturnType<typeof readAuditShardEvents>;
+  try {
+    rows = readAuditShardEvents(projectDir, intent, space).sort((a, b) =>
+      a.timestamp.localeCompare(b.timestamp) || a.shardIndex - b.shardIndex || a.pos - b.pos);
+  } catch {
+    return null;
+  }
+  const dag = resolveBoltDag(projectDir, intent, space);
+  const items: string[] = [];
+  for (const stage of dropped) {
+    const units = new Set(dag.state === "ok" ? dag.units : []);
+    for (const row of rows) {
+      const unit = auditBlockField(row.block, "Unit");
+      if (unit && auditBlockField(row.block, "Stage") === stage.slug) units.add(unit);
+    }
+    const open = new Set(unitLifecycleSnapshot(projectDir, stage.slug, rows, before).open.map((c) => c.unit));
+    for (const unit of units) {
+      const waiting = (["per-stage", "unit-end"] as const).some((gateScope) => {
+        const status = unitGateStatus(projectDir, stage.slug, unit, gateScope, rows);
+        return status === "awaiting-approval" || status === "revising";
+      });
+      if (waiting) items.push(`the ${unitPlainName(unit)} Unit's ${stage.name} approval`);
+      else if (open.has(unit)) items.push(`the ${unitPlainName(unit)} Unit's ${stage.name} work`);
+    }
+  }
+  if (items.length === 0) return null;
+  const list = items.length === 1
+    ? items[0]
+    : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+  return `${list.charAt(0).toUpperCase()}${list.slice(1)} ${items.length === 1 ? "is" : "are"} no longer part of the plan.`;
+}
+
 function handleScopeChange(projectDir: string, flags: Record<string, string>): void {
   const newScope = flags.scope;
   if (!newScope) die("--scope is required for scope-change");
@@ -10939,8 +10994,10 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
           },
         })),
       );
-      // What happened and how to go back, then each stage it skipped and each
-      // setting whose value changed. Nothing runs until the person asks.
+      const droppedUnitWork = droppedUnitWorkLine(projectDir, contentBefore, content, intent, space);
+      // What happened and how to go back, then each stage it skipped, the Unit
+      // work it dropped, and each setting whose value changed. Nothing runs
+      // until the person asks.
       outputLines = [
         `Switched to ${newScope}: ${executeStages.length} stages (${completedCount} done), ` +
           `${gates} approval gates${ceremonyOffClause(summary)}.` +
@@ -10948,6 +11005,7 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
         ...skippedNow.map(({ slug, was }) =>
           `Skipped ${findStageBySlug(slug)?.name ?? slug} (${was}): ${newScope} does not run it. ` +
             `To run it on its own, type \`${entrySkillInvocation()} --stage ${slug} --single\`.`),
+        ...(droppedUnitWork === null ? [] : [droppedUnitWork]),
         ...update.lines,
         ...(keptPolicyLine === null ? [] : [keptPolicyLine]),
       ];
@@ -11335,11 +11393,13 @@ function handleRecompose(projectDir: string, flags: Record<string, string>, rawA
       recordHookDrop(projectDir, "active-directive", errorMessage(e));
     }
 
+    const droppedUnitWork = droppedUnitWorkLine(projectDir, before, content, flags.intent, flags.space);
     process.stdout.write(
       `Recomposed: ${skipList.length} skipped (${skipList.join(", ") || "none"}), ` +
         `${addList.length} added (${addList.join(", ") || "none"})\n` +
         `Stages in scope: ${executeStages.length}\n` +
         `Completed: ${completedCount}/${executeStages.length}\n` +
+        (droppedUnitWork === null ? "" : `${droppedUnitWork}\n`) +
         settingsUpdate.lines.map((line) => `${line}\n`).join(""),
     );
   }, undefined, undefined, WORKSPACE_MUTATION_LOCK_RETRIES);
