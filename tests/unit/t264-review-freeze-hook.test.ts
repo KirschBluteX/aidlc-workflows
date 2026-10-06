@@ -1,4 +1,4 @@
-// covers: hook:aidlc-review-freeze, hook:review-freeze-command, function:freshReviewReceipts, function:producesArtifactFile, function:producesArtifactUnit, audit:REVIEW_FREEZE_BLOCKED
+// covers: hook:aidlc-review-freeze, file:hooks/aidlc-kiro-adapter.ts, hook:review-freeze-command, function:freshReviewReceipts, function:producesArtifactFile, function:producesArtifactUnit, audit:REVIEW_FREEZE_BLOCKED
 //
 // t264 - the deterministic PreToolUse enforcement of the §12a terminal-receipt
 // ordering (the receipt-invalidation loop's hook half; the prose half is
@@ -20,7 +20,9 @@
 //   (c) registration pins per harness: Claude settings.json (third entry in
 //       the shared PreToolUse group), Codex emit wiring + adapter target,
 //       Kiro CLI conductor fs_write registration, opencode plugin call, and
-//       the deliberate Kiro IDE absence.
+//       the Kiro IDE PreToolUse registration;
+//   (d) the Kiro IDE adapter route over the same ledger: each Kiro write and
+//       shell tool reaches the shared hook and a block comes back as exit 2.
 //
 // Mechanism = mixed: (a) is in-process import; (b) spawns the real hook and
 // real CLI tools at the process boundary; (c) is text/JSON invariants.
@@ -39,13 +41,14 @@ import {
 } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, relative as relativePath, resolve } from "node:path";
 import {
   blockReason,
   judgeFreeze,
@@ -597,6 +600,76 @@ describe("t264 (a) judgeFreeze decision table", () => {
     );
   });
 
+  test("writeTargets: a PowerShell location change moves the reading the way PowerShell does", () => {
+    const targets = (command: string): string[] =>
+      writeTargets("Bash", { command }, "/p", "powershell")
+        .map((path) => path.replaceAll("\\", "/").replace(/^[A-Za-z]:/, ""));
+    for (const command of [
+      "Set-Location .kiro\\hooks; Set-Content y.json x",
+      "cd .kiro\\hooks; Set-Content y.json x",
+      "sl -Path .kiro\\hooks; Set-Content y.json x",
+      "Set-Location -LiteralPath '.kiro\\hooks'; Set-Content y.json x",
+      "Push-Location .kiro; Set-Content hooks\\y.json x",
+      "pushd .kiro; 'x' | Tee-Object hooks\\y.json",
+      "Write-Output (Set-Location .kiro\\hooks); Set-Content y.json x",
+    ]) {
+      expect(targets(command), command).toContain("/p/.kiro/hooks/y.json");
+    }
+    // A positional directory moves the reading once.
+    expect(targets("Set-Location .kiro; Set-Content -Path y.json -Value x").sort()).toEqual(["/p/.kiro/y.json", "/p/y.json"]);
+    // The reading from the call's cwd stays; history and stack names add nothing.
+    expect(targets("Set-Location -; Set-Content -Path y.json -Value x")).toEqual(["/p/y.json"]);
+    expect(targets("Set-Location +; Set-Content -Path y.json -Value x")).toEqual(["/p/y.json"]);
+    expect(targets("Push-Location -StackName s; Set-Content -Path y.json -Value x")).toEqual(["/p/y.json"]);
+    expect(writeTargets("Bash", { command: "pushd +; echo x > y" }, "/p")
+      .map((path) => path.replaceAll("\\", "/").replace(/^[A-Za-z]:/, ""))).toEqual(["/p/y"]);
+    // ~, $HOME and ${HOME} take a backslash and any case, as PowerShell reads
+    // them: from HOME, and on Windows from the user profile instead.
+    const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, T264_HOME: process.env.T264_HOME };
+    try {
+      process.env.HOME = "/ph";
+      process.env.USERPROFILE = "/pu";
+      const [profile, other] = process.platform === "win32" ? ["/pu", "/ph"] : ["/ph", "/pu"];
+      for (const command of [
+        "Set-Content -Path ~\\r\\x -Value v",
+        "Set-Content -Path $HOME\\r\\x -Value v",
+        "Set-Content -Path $home\\r\\x -Value v",
+        "Set-Content -Path $" + "{Home}\\r\\x -Value v",
+        "Set-Location ~\\r; Set-Content -Path x -Value v",
+      ]) {
+        expect(targets(command), command).toContain(`${profile}/r/x`);
+        expect(targets(command), command).not.toContain(`${other}/r/x`);
+      }
+      expect(targets("Set-Location; Set-Content -Path x -Value v")).toContain(`${profile}/x`);
+      // No $env: variable is read from the hook's environment: its value never
+      // enters a target (and so never a refusal), and a command can reassign it.
+      process.env.T264_HOME = "/sentinel-t264";
+      for (const command of [
+        "Set-Content -Path $env:T264_HOME\\r\\x -Value v",
+        "Set-Content -Path $" + "{env:T264_HOME}\\r\\x -Value v",
+        "Set-Content -Path $env:HOME\\r\\x -Value v",
+        "Set-Location $env:T264_HOME; Set-Content -Path x -Value v",
+      ]) {
+        expect(targets(command).some((path) => path.includes("sentinel") || path.startsWith("/ph/")), command).toBe(false);
+      }
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+    // POSIX: bash's cd takes +1 as a directory; pushd's +1 and pushd -n stay put.
+    const posix = (command: string): string[] =>
+      writeTargets("Bash", { command }, "/p").map((path) => path.replaceAll("\\", "/").replace(/^[A-Za-z]:/, ""));
+    expect(posix("cd +1 && echo x > y")).toContain("/p/+1/y");
+    expect(posix("pushd +1 && echo x > y")).toEqual(["/p/y"]);
+    expect(posix("pushd -n d && echo x > y")).toEqual(["/p/y"]);
+    expect(posix("pushd -n -- d && echo x > y")).toEqual(["/p/y"]);
+    // The POSIX reading of the same line drops the backslashes.
+    expect(writeTargets("Bash", { command: "cd .kiro\\hooks; echo x > y.json" }, "/p")
+      .map((path) => path.replaceAll("\\", "/").replace(/^[A-Za-z]:/, ""))).not.toContain("/p/.kiro/hooks/y.json");
+  });
+
   test("writeTargets: a PowerShell command is read as PowerShell (#1639)", () => {
     const targets = (command: string): string[] =>
       writeTargets("Bash", { command }, "/p", "powershell")
@@ -1121,24 +1194,130 @@ describe("t264 (c) harness registration", () => {
     expect(adapter).toContain('input: claudeShaped("PreToolUse", reviewerToolName)');
   });
 
-  test("Kiro IDE ships the hook body but NO registration (prose-only harness)", () => {
-    // The body lands via the whole-dir hooks copy; no .kiro.hook wiring file
-    // consumes it (PreToolUse tool inputs are not uniformly available there).
+  test("Kiro IDE registers review-freeze as its own PreToolUse hook", () => {
+    // Kiro runs every PreToolUse hook even after an earlier one blocks, so the
+    // freeze is a file of its own beside plan-approval-guard, not a branch of it.
+    for (const root of [
+      join(REPO_ROOT, "harness", "kiro-ide", "hooks"),
+      join(REPO_ROOT, "dist", "kiro-ide", ".kiro", "hooks"),
+    ]) {
+      const manifest = JSON.parse(readFileSync(join(root, "aidlc-review-freeze.json"), "utf-8")) as {
+        hooks: Array<{ trigger: string; matcher?: string; action: { command: string } }>;
+      };
+      expect(manifest.hooks).toHaveLength(1);
+      expect(manifest.hooks[0].trigger).toBe("PreToolUse");
+      // It fires for the write and shell tools the adapter forwards (t218 pins
+      // that the two sets agree), not for reads.
+      const matcher = new RegExp(manifest.hooks[0].matcher ?? "^$");
+      expect(matcher.test("fs_write") && matcher.test("execute_bash")).toBe(true);
+      expect(matcher.test("read_file")).toBe(false);
+      expect(manifest.hooks[0].action.command).toEndWith(" engine adapter kiro-ide review-freeze");
+    }
     expect(existsSync(join(REPO_ROOT, "dist", "kiro-ide", ".kiro", "hooks", "aidlc-review-freeze.ts"))).toBe(true);
-    expect(
-      existsSync(join(REPO_ROOT, "harness", "kiro-ide", "hooks", "aidlc-review-freeze.kiro.hook")),
-    ).toBe(false);
-    const ideConductor = readFileSync(
-      join(REPO_ROOT, "harness", "kiro-ide", "agents", "aidlc.md"),
+    const adapter = readFileSync(
+      join(REPO_ROOT, "harness", "kiro-ide", "hooks", "aidlc-kiro-adapter.ts"),
       "utf-8",
     );
-    expect(ideConductor).not.toContain("review-freeze");
-    for (const name of readdirSync(join(REPO_ROOT, "harness", "kiro-ide", "agents"))) {
-      if (!name.endsWith("-agent.md")) continue;
-      expect(
-        readFileSync(join(REPO_ROOT, "harness", "kiro-ide", "agents", name), "utf-8"),
-        name,
-      ).not.toContain("review-freeze");
+    expect(adapter).toContain('case "review-freeze":');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (d) The Kiro IDE adapter route
+// ---------------------------------------------------------------------------
+
+const KIRO_IDE_TREE = join(REPO_ROOT, "dist", "kiro-ide", ".kiro");
+
+function runKiroIde(
+  p: string,
+  target: string,
+  payload: Record<string, unknown>,
+  envOverrides: NodeJS.ProcessEnv = {},
+): { code: number; stderr: string } {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLAUDE_PROJECT_DIR: p,
+    AIDLC_COMPILED_EXECUTABLE: "",
+    ...envOverrides,
+  };
+  delete env.USER_PROMPT;
+  const r = spawnSync(BUN, [join(p, ".kiro", "hooks", "aidlc-kiro-adapter.ts"), target], {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    input: JSON.stringify({ hook_event_name: "PreToolUse", cwd: p, session_id: "sess_t264-ide", ...payload }),
+    env,
+    encoding: "utf-8",
+  });
+  return { code: r.status ?? -1, stderr: r.stderr ?? "" };
+}
+
+describe("t264 (d) Kiro IDE adapter route", () => {
+  test("Kiro write and shell tools reach the freeze; reads and other paths do not", () => {
+    const p = projBeforeGate();
+    cpSync(KIRO_IDE_TREE, join(p, ".kiro"), { recursive: true });
+    const file = raArtifact(p);
+    const write = { tool_name: "fs_write", tool_input: { path: file, text: "# Changed\n" } };
+    expect(runKiroIde(p, "review-freeze", write).code).toBe(0);
+    recordReview(p, "READY");
+    openGate(p);
+    for (const call of [
+      write,
+      { tool_name: "str_replace", tool_input: { path: file, oldStr: "# Requirements", newStr: "# Changed" } },
+      { tool_name: "fs_append", tool_input: { path: file, text: "more\n" } },
+      { tool_name: "delete_file", tool_input: { explanation: "remove it", targetFile: file } },
+      { tool_name: "execute_bash", tool_input: { command: `echo changed > '${file}'` } },
+    ]) {
+      const r = runKiroIde(p, "review-freeze", call);
+      expect(r.code, call.tool_name).toBe(2);
+      expect(r.stderr, call.tool_name).toContain("review-freeze");
     }
+    // A relative redirect resolves from the shell call's own cwd.
+    const relative = runKiroIde(p, "review-freeze", {
+      tool_name: "execute_bash",
+      tool_input: { command: "echo changed > requirements.md", cwd: dirname(file) },
+    });
+    expect(relative.code).toBe(2);
+    expect(relative.stderr).toContain("review-freeze");
+    // So does one after a literal cd or pushd, from wherever that leaves the shell.
+    const reviewedDir = relativePath(p, dirname(file));
+    for (const command of [
+      `cd '${reviewedDir}' && echo changed > requirements.md`,
+      `pushd '${dirname(reviewedDir)}' && echo changed > '${basename(dirname(file))}/requirements.md'`,
+    ]) {
+      const r = runKiroIde(p, "review-freeze", { tool_name: "execute_bash", tool_input: { command, cwd: p } });
+      expect(r.code, command).toBe(2);
+      expect(r.stderr, command).toContain("review-freeze");
+    }
+    // An execute_pwsh command reaches the freeze marked as PowerShell, so a
+    // backslash path (in Tee-Object too) and Set-Location read the way PowerShell runs them.
+    const backslashed = reviewedDir.replaceAll("/", "\\");
+    for (const command of [
+      `Set-Content ${backslashed}\\requirements.md changed`,
+      `'changed' | Tee-Object ${backslashed}\\requirements.md`,
+      `Set-Location ${backslashed}; Set-Content requirements.md changed`,
+      `Push-Location -Path ${backslashed}; sc requirements.md changed`,
+    ]) {
+      const r = runKiroIde(p, "review-freeze", { tool_name: "execute_pwsh", tool_input: { command, cwd: p } });
+      expect(r.code, command).toBe(2);
+      expect(r.stderr, command).toContain("review-freeze");
+    }
+    expect(runKiroIde(p, "review-freeze", {
+      tool_name: "execute_pwsh",
+      tool_input: { command: `Set-Location ${backslashed}; Set-Content notes.md x`, cwd: p },
+    }).code).toBe(0);
+    // A home-relative backslash path, with the project as PowerShell's home.
+    const home = { HOME: p, USERPROFILE: p };
+    for (const command of [
+      `Set-Content $HOME\\${backslashed}\\requirements.md changed`,
+      `Set-Content ~\\${backslashed}\\requirements.md changed`,
+    ]) {
+      const r = runKiroIde(p, "review-freeze", { tool_name: "execute_pwsh", tool_input: { command, cwd: p } }, home);
+      expect(r.code, command).toBe(2);
+      expect(r.stderr, command).toContain("review-freeze");
+    }
+    expect(runKiroIde(p, "review-freeze", { tool_name: "read_file", tool_input: { path: file } }).code).toBe(0);
+    expect(runKiroIde(p, "review-freeze", {
+      tool_name: "fs_write",
+      tool_input: { path: join(dirname(file), "notes.md"), text: "x" },
+    }).code).toBe(0);
   });
 });

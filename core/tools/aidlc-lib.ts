@@ -894,9 +894,10 @@ export const DEFAULT_SPACE = "default";
 // (e.g. the Kiro userPromptSubmit hook) can dispatch them deterministically off
 // the SAME classification the engine uses — never a divergent hardcoded list.
 //
-//   - read-only utility flags: matched ANYWHERE in the args (mirrors the engine's
-//     parseNextFlags, which sets `readOnly` on any matching token). Each maps to
-//     its subcommand by stripping the leading `--` (--status→status, …).
+//   - read-only utility flags: matched anywhere among flags, but never among the
+//     person's own words (nextArgsCarryRequestWords; the engine's parseNextFlags
+//     applies the same rule). Each maps to its subcommand by stripping the
+//     leading `--` (--status→status, …).
 //   - workspace commands: parsed ONLY when the LEADING token is a workspace
 //     noun/legacy verb, so freeform prose merely containing "space"/"intent"
 //     stays intent text. A leading workspace noun wins over later read-only
@@ -907,6 +908,22 @@ export const READ_ONLY_FLAGS: ReadonlySet<string> = new Set([
   "--doctor",
   "--version",
 ]);
+// Whether the args carry words of the person's own: a token that is not a flag
+// and does not follow one (a flag's value), or anything after `--`. Among such
+// words a utility flag is part of what they asked for ("add a --version flag
+// that prints the version"), not AI-DLC's own utility; alone, or among other
+// flags, it is the utility. parseNextFlags and the harness seams read the
+// same rule, so they never disagree on one command.
+export function nextArgsCarryRequestWords(args: readonly string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") return i + 1 < args.length;
+    if (arg.startsWith("-")) continue;
+    if (i > 0 && args[i - 1].startsWith("-")) continue;
+    return true;
+  }
+  return false;
+}
 export const WORKSPACE_VERBS: ReadonlySet<string> = new Set([
   "space",
   "space-create",
@@ -1035,6 +1052,7 @@ export function isReadOnlyNextArgv(argv: readonly string[]): boolean {
   if (parsePluginCommand(args).kind !== "not-plugin" || parseKnowledgeCommand(args).kind !== "not-knowledge") return false;
   const workspace = parseWorkspaceCommand(args);
   if (workspace.kind !== "not-workspace") return workspace.kind !== "create-intent";
+  if (nextArgsCarryRequestWords(args)) return false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--") break;
@@ -1704,6 +1722,8 @@ export function classifyTerminalCommand(argv: string[]): TerminalCommand | null 
     if (workspaceCommand.kind === "create-intent") return null;
     return terminalCommandFromWorkspaceCommand(workspaceCommand, args);
   }
+  // Among the person's own words a utility flag is part of their request.
+  if (nextArgsCarryRequestWords(args)) return null;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (READ_ONLY_FLAGS.has(a)) {
@@ -14369,7 +14389,8 @@ export interface FreshReviewReceipts {
   /** Units whose review's source binding relaxed and off keep although it
    *  cannot be compared path by path here: the reviewed listing is not on this
    *  machine, the Unit's list of files changed after its review, or the
-   *  project source cannot be read. Each is said once. */
+   *  project source cannot be read, now or when it was reviewed. Each is said
+   *  once. */
   unitSourceKept: Set<string>;
   /** Units the person approved at their checkpoint after their latest
    *  re-check: that approval opens a fresh one, so their progress above
@@ -19153,8 +19174,12 @@ export function freshReviewReceipts(
       // could not be bound: strict holds it stale; relaxed and off keep it.
       const unchecked = receipt.bypass || receipt.fingerprint === UNBINDABLE_FINGERPRINT;
       if (unchecked) {
-        if (isRelaxed()) acceptUncheckedSource(unit, receipt.fingerprint ?? "(not recorded)", null);
-        else stale = true;
+        if (isRelaxed()) {
+          acceptUncheckedSource(unit, receipt.fingerprint ?? "(not recorded)", null);
+          // A review that could not bind the source keeps its binding now that
+          // the source reads: the checkpoint holds its verdict the same way.
+          if (receipt.fingerprint === UNBINDABLE_FINGERPRINT) unitSourceKept.add(unit);
+        } else stale = true;
       }
       if (!unchecked && receipt.fingerprint !== null) {
         const snapshot = readUnitSourceSnapshot(
@@ -37622,6 +37647,17 @@ export function guardStoodAsideLine(
     : `Not recorded in the audit trail, which was busy or could not be written; \`${aidlcInvocation()} doctor\` lists it`;
   return `Continuing past the ${fence} check because it is off for this piece of work (${source}). ` +
     `${where}${detail ? `: ${detail}` : "."}`;
+}
+
+/**
+ * Whether a lowered fence says that it stood aside. Under Guard Policy off it
+ * says nothing: off means off, and the person heard the one line when the
+ * policy was set. The GUARD_STOOD_ASIDE row still records every pass.
+ * Relaxed and strict keep their line, including for a fence the person
+ * switched off themselves.
+ */
+export function guardStandAsideSpeaks(gate: { policy: GuardPolicy }): boolean {
+  return gate.policy !== "off";
 }
 
 /**

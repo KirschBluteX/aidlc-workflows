@@ -72,6 +72,9 @@
 //     fingerprint/decision/answer ownership after canonical record writes,
 //     and bind approval to the planned workspace source the questions file
 //     records.
+//   - review-freeze, state-transition-guard: forward a write or shell call in
+//     the shared guards' shape; refuse a call they cannot read (malformed, no
+//     tool name, a write naming no file, a shell call with no command).
 //   - session-start: retain the modern session_id or derive a legacy identity
 //     from the measured IDE host-instance environment.
 //   - record-human-turn: Kiro IDE 1.1.14 runs no SessionStart hook when a chat
@@ -92,7 +95,8 @@
 // where <target> ∈ record-human-turn | enforce-approval-gate | session-start |
 //                  audit-and-sensors | rebuild-stage-graph |
 //                  sync-workflow-state | log-subagent | continue-workflow |
-//                  session-end | verb-intercept | terminal-command-guard
+//                  session-end | verb-intercept | terminal-command-guard |
+//                  plan-approval-guard | review-freeze | state-transition-guard
 
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -197,6 +201,8 @@ const PAYLOAD_TARGETS = new Set([
   "log-subagent",
   "plan-approval-guard",
   "rebuild-stage-graph",
+  "review-freeze",
+  "state-transition-guard",
   "terminal-command-guard",
 ]);
 const SESSION_ID_TARGETS = new Set([
@@ -1878,6 +1884,77 @@ function isFailedWriteResult(toolResult: string): boolean {
   );
 }
 
+// The shared guards' Write/Edit/Bash shape for a Kiro write or shell call, or
+// null for any other tool. Kiro names the written text `text` (fs_write,
+// fs_append; `content` under the 2.6.1 `write`) and a replacement
+// `oldStr`/`newStr` (str_replace); the core reads `content` and
+// `old_string`/`new_string`.
+function guardToolCall(
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+): { tool_name: string; tool_input: Record<string, unknown> } | null {
+  const writeTool = canonicalWriteTool(toolName);
+  if (writeTool) {
+    const paths = inputPaths(toolArgs);
+    const text = typeof toolArgs.text === "string"
+      ? toolArgs.text
+      : typeof toolArgs.content === "string" ? toolArgs.content : undefined;
+    return {
+      tool_name: writeTool,
+      tool_input: {
+        file_path: paths[0] ?? "",
+        paths,
+        ...(writeTool === "Write" && text !== undefined ? { content: text } : {}),
+        ...(toolName === "fs_append" && text !== undefined ? { new_string: text } : {}),
+        ...(typeof toolArgs.oldStr === "string" ? { old_string: toolArgs.oldStr } : {}),
+        ...(typeof toolArgs.newStr === "string" ? { new_string: toolArgs.newStr } : {}),
+        ...(toolArgs.replace_all === true ? { replace_all: true } : {}),
+      },
+    };
+  }
+  if (isKiroShellTool(toolName)) {
+    return {
+      tool_name: "Bash",
+      tool_input: { command: typeof toolArgs.command === "string" ? toolArgs.command : "" },
+    };
+  }
+  return null;
+}
+
+// The directory a Kiro shell call runs in: its own `cwd`, which every captured
+// Kiro shell payload carries, else the project. Its relative paths resolve from
+// there; the core finds the project from AIDLC_PROJECT_DIR, not from this.
+function shellToolCwd(toolName: string, toolArgs: Record<string, unknown>): string {
+  return isKiroShellTool(toolName) && typeof toolArgs.cwd === "string" && toolArgs.cwd !== ""
+    ? resolve(projectDir, toolArgs.cwd)
+    : projectDir;
+}
+
+// What review-freeze and state-transition-guard cannot read in this call, or
+// null when they can. Every PreToolUse payload of the supported builds (Kiro
+// IDE 1.1.70, Kiro CLI 2.24.1 and later) names the tool and fills its input,
+// so a call they cannot read is refused rather than judged as one with no
+// target. A readable command that writes nothing still goes to the guards.
+function unreadableGuardCall(): string | null {
+  if (Object.keys(ide).length === 0) return "no hook payload arrived";
+  if ((ide.malformedFields?.length ?? 0) > 0) {
+    return `its hook payload is malformed (${ide.malformedFields?.join(", ")})`;
+  }
+  const toolName = ide.toolName ?? "";
+  if (toolName === "") return "its hook payload names no tool";
+  const toolArgs = ide.toolArgs ?? {};
+  if (canonicalWriteTool(toolName) !== "" && inputPaths(toolArgs).length === 0) {
+    return `${toolName} names no file`;
+  }
+  if (
+    isKiroShellTool(toolName) &&
+    (typeof toolArgs.command !== "string" || toolArgs.command.trim() === "")
+  ) {
+    return `${toolName} carries no command`;
+  }
+  return null;
+}
+
 function inputPaths(input: Record<string, unknown>): string[] {
   const paths: string[] = [];
   const add = (value: unknown) => {
@@ -1946,6 +2023,21 @@ function loweredPlanCheckAdmitsApprovedWork(): boolean {
 let promptSessionStart = "";
 
 function buildForward(): Forward {
+  // Ahead of the malformed-payload drop below: for these two guards an
+  // unreadable call is refused, whatever the workflow, fence or off-switch.
+  if (target === "review-freeze" || target === "state-transition-guard") {
+    const unreadable = unreadableGuardCall();
+    if (unreadable !== null) {
+      return {
+        hook: "__unreadable_guard_call__",
+        input: {
+          reason:
+            `AI-DLC cannot check this Kiro tool call: ${unreadable}. ` +
+            "AI-DLC supports Kiro IDE 1.1.70 or later and Kiro CLI 2.24.1 or later. If Kiro is older, update it; then try again.",
+        },
+      };
+    }
+  }
   if (PAYLOAD_TARGETS.has(target) && (ide.malformedFields?.length ?? 0) > 0) {
     recordHookDrop(
       projectDir,
@@ -2419,7 +2511,7 @@ function buildForward(): Forward {
               command:
                 typeof toolArgs.command === "string" ? toolArgs.command : "",
             },
-            cwd: projectDir,
+            cwd: shellToolCwd(toolName, toolArgs),
             // The guard reads a PowerShell command the way PowerShell runs it.
             ...(isKiroPowerShellTool(toolName) ? { aidlc_shell: "powershell" } : {}),
           },
@@ -2481,6 +2573,27 @@ function buildForward(): Forward {
       };
     }
 
+    // Kiro runs a project PreToolUse hook on a delegated agent's own calls too,
+    // under the conductor's session and with no agent identity (measured on
+    // IDE 1.2.4), so both guards judge a delegate's call as the conductor's.
+    case "review-freeze":
+    case "state-transition-guard": {
+      const toolArgs = ide.toolArgs ?? {};
+      const call = guardToolCall(ide.toolName ?? "", toolArgs);
+      if (call === null) return null;
+      return {
+        hook: target === "review-freeze"
+          ? "aidlc-review-freeze.ts"
+          : "aidlc-state-transition-guard.ts",
+        input: {
+          hook_event_name: "PreToolUse",
+          ...call,
+          cwd: shellToolCwd(ide.toolName ?? "", toolArgs),
+          // Both guards read a PowerShell command the way PowerShell runs it.
+          ...(isKiroPowerShellTool(ide.toolName ?? "") ? { aidlc_shell: "powershell" } : {}),
+        },
+      };
+    }
     case "audit-and-sensors": {
       // postToolUse(write) → write-audit-log THEN run-sensors (both ship core).
       // Captured PostToolUse write inputs are empty, so the file path comes
@@ -2844,6 +2957,10 @@ if (fwd.hook === "__legacy_plan_approval_block__") {
   process.stderr.write(`${String(fwd.input.reason ?? "Plan Approval blocked this tool.")}\n`);
   return 2;
 }
+if (fwd.hook === "__unreadable_guard_call__") {
+  process.stderr.write(`${String(fwd.input.reason)}\n`);
+  return 2;
+}
 hookDebug(projectDir, "kiro-adapter", "forward", {
   target,
   hook: fwd.hook,
@@ -2901,10 +3018,14 @@ if (fwd.hook === "__audit_and_sensors__") {
   return 0;
 }
 
-// The core guard judges the workflow of the session named in its payload; the
-// routes above build its input from the tool call alone. Legacy events carry no
+// The core guards judge the workflow of the session named in their payload; the
+// routes above build their input from the tool call alone. Legacy events carry no
 // session id, so send the host-derived identity SessionStart bound instead.
-if (fwd.hook === "aidlc-plan-approval-guard.ts") {
+if (
+  fwd.hook === "aidlc-plan-approval-guard.ts" ||
+  fwd.hook === "aidlc-review-freeze.ts" ||
+  fwd.hook === "aidlc-state-transition-guard.ts"
+) {
   fwd.input.session_id = resolvedPlanApprovalSessionId(ide);
 }
 // A prompt that starts its chat's session runs session-start first, as

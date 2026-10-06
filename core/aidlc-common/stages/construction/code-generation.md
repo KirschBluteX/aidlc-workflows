@@ -43,8 +43,6 @@ requires_stage:
   - infrastructure-design
 sensors:
   - required-sections
-  - linter
-  - type-check
   - traceability
 scopes:
   - enterprise
@@ -516,11 +514,15 @@ the record dir); the planning, plan-approval, and summary artefacts
 `unit-test-instructions.md`, `code-summary.md`) live under
 `<code-generation-record>/`.
 
-Imports: `required-sections`, `linter`, `type-check`, `traceability`.
+Imports: `required-sections`, `traceability`.
 
 `required-sections` checks each planning and summary artefact for at least two
-H2 headings. `linter` and `type-check` run against matching generated code,
-and `traceability` verifies the per-Unit coverage table and every `OK` target.
+H2 headings, and `traceability` verifies the per-Unit coverage table and every
+`OK` target.
+
+`linter` and `type-check` are not imported here: they ran on every file write
+and nothing read their results; Build and Test runs the project's build and
+tests.
 
 `upstream-coverage` is intentionally NOT imported because the stage consumes a
 broad, scope-dependent design set. `source-manifest.json` is

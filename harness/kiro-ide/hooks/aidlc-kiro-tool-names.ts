@@ -7,8 +7,8 @@
 // `orchestrate_subagent` on Kiro CLI. The adapter asks this table what a name
 // is. The hook registrations (hooks/*.json) are written by hand, and t245
 // compares each one's matcher with the one KIRO_HOOK_MATCHERS builds from this
-// table: a shell, delegate, or audited write name added here also has to be
-// added to the registrations that deliver it.
+// table: a write, shell, delegate or audited write name added here also has
+// to be added to the registrations that deliver it.
 //
 // This file has no imports: t245 reads it straight from the authored tree, and
 // the adapter imports it from beside itself in every projection.
@@ -29,7 +29,10 @@ type KiroTool =
 
 const KIRO_TOOLS: Record<string, KiroTool> = {
   // Before Plan Approval on a build that sends no tool arguments, only the two
-  // legacy planning writes may author the plan files.
+  // legacy planning writes may author the plan files. `write` is the kiro-cli
+  // 2.6.1 name (captured with `command: "create"`); no KAS capture carries it,
+  // but a call under that name is still a write.
+  write: { role: "write", audited: false },
   fs_write: { role: "write", audited: true, legacyPlanningWrite: true },
   create_file: { role: "write", audited: false },
   str_replace: { role: "edit", audited: true, legacyPlanningWrite: true },
@@ -37,6 +40,9 @@ const KIRO_TOOLS: Record<string, KiroTool> = {
   // `delete_file` names its target `targetFile` (every captured payload is
   // {explanation, targetFile}).
   delete_file: { role: "edit", audited: false },
+  // No payload of these is captured (none was seen on Kiro IDE 1.2.4 or Kiro
+  // CLI 2.27.1), and a patch carries its paths inside its text, which the
+  // adapter does not read: one with no path field the adapter reads is refused.
   apply_patch: { role: "edit", audited: false },
   edit_file: { role: "edit", audited: false },
   // The shell tool is `execute_bash` on POSIX hosts, `execute_pwsh` on Windows,
@@ -169,6 +175,9 @@ export const KIRO_HOOK_MATCHERS = {
   ).join("|"),
   shellPostToolUse: shellNames,
   shellPreToolUse: `^(${shellNames})$`,
+  writeOrShellPreToolUse: `^(${
+    [...namesWhere((tool) => tool.role === "write" || tool.role === "edit"), shellNames].join("|")
+  })$`,
   delegateCompletion: `^(${
     [`${NAMED_DELEGATE_PREFIX}.+`, ...namesWhere((tool) => tool.role === "delegate")].join("|")
   })$`,

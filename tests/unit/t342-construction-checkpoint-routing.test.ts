@@ -131,7 +131,7 @@ function next(p: string) {
     construction_checkpoint?: {
       kind: string; unit: string; human_required: boolean; verification_command: string | null; command_authorized: boolean;
       ready?: boolean; rereview?: { stage: string; iteration: number; command: string };
-      rechecked?: { verdict: string; approved_before: boolean };
+      rechecked?: { verdict: string; approved_before: boolean; changed?: string; redone?: true };
     };
     reviewer?: string;
     construction_policy?: { offer_autonomy: boolean; completion_only: boolean; human_completion_required: boolean };
@@ -2691,6 +2691,134 @@ describe("t342 a unit-major recovery keeps every Unit's finished work", () => {
       expect(next(p)).toMatchObject({ stage: "functional-design", unit: "beta" });
     }
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  // The person chose Redo for approved alpha's NFR Requirements (recorded as
+  // `state reuse-artifact` records it), got a new document, and its review is
+  // the re-check. Under relaxed and off the checkpoint asks once, as new work;
+  // strict keeps the re-check of a change. A Redo the agent did on its own, or
+  // a plain edit, is not the person's redo.
+  function redoAlphaDocument(p: string, byPerson: boolean) {
+    if (byPerson) {
+      const document = join(seededRecordDir(p), "construction", "alpha", "nfr-requirements",
+        artifactFilename(findStageBySlug("nfr-requirements")!.produces![0]));
+      const redo = tool(p, "state", [
+        "reuse-artifact", "nfr-requirements", "--decision", "redo",
+        "--artifacts", relative(seededRecordDir(p), document).replaceAll("\\", "/"),
+      ]);
+      expect(redo.status, redo.out).toBe(0);
+    }
+    editAlphaDocument(p, "The redone requirements.");
+    const rechecked = reviewThroughLog(p, [
+      "review", "--stage", "nfr-requirements", "--reviewer", REVIEWER, "--unit", "alpha", "--iteration", "2",
+    ]);
+    expect(rechecked.status, rechecked.out).toBe(0);
+    expect(rechecked.request?.recovery).toBe("stale-receipt");
+    return next(p).construction_checkpoint;
+  }
+
+  for (const policy of ["off (set by you)", "relaxed (set by you)"]) {
+    test(`a redo the person asked for of an approved Unit is asked about once, as new work (${policy.split(" ")[0]})`, () => {
+      const p = policyFixture("classic", policy);
+      buildReviewed(p, "alpha", undefined, true);
+      approve(p, "alpha");
+      expect(redoAlphaDocument(p, true)).toMatchObject({
+        unit: "alpha", ready: true,
+        rechecked: { verdict: "READY", approved_before: true, changed: "documents", redone: true },
+      });
+      approve(p, "alpha");
+      expect(next(p)).toMatchObject({ stage: "functional-design", unit: "beta" });
+    }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+  }
+
+  test("strict: a redo the person asked for keeps the re-check of a change", () => {
+    const p = policyFixture("classic", "strict (set by you)");
+    buildReviewed(p, "alpha", undefined, true);
+    approve(p, "alpha");
+    const checkpoint = redoAlphaDocument(p, true);
+    expect(checkpoint).toMatchObject({
+      unit: "alpha", ready: true, rechecked: { verdict: "READY", approved_before: true, changed: "documents" },
+    });
+    expect(checkpoint?.rechecked?.redone).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("off: a new document the agent made without the person's Redo keeps the re-check wording", () => {
+    const p = policyFixture("classic", "off (set by you)");
+    buildReviewed(p, "alpha", undefined, true);
+    approve(p, "alpha");
+    const checkpoint = redoAlphaDocument(p, false);
+    expect(checkpoint).toMatchObject({ unit: "alpha", rechecked: { approved_before: true, changed: "documents" } });
+    expect(checkpoint?.rechecked?.redone).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("a Redo of another Unit's work does not count for this one", () => {
+    const p = policyFixture("classic", "off (set by you)");
+    buildReviewed(p, "alpha", undefined, true);
+    approve(p, "alpha");
+    const redo = tool(p, "state", [
+      "reuse-artifact", "nfr-requirements", "--decision", "redo", "--artifacts", "construction/beta/nfr-requirements/x.md",
+    ]);
+    expect(redo.status, redo.out).toBe(0);
+    const checkpoint = redoAlphaDocument(p, false);
+    expect(checkpoint?.rechecked?.redone).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("a redo listing the documents by their full record path counts for the Unit", () => {
+    const p = policyFixture("classic", "off (set by you)");
+    buildReviewed(p, "alpha", undefined, true);
+    approve(p, "alpha");
+    const document = join(seededRecordDir(p), "construction", "alpha", "nfr-requirements",
+      artifactFilename(findStageBySlug("nfr-requirements")!.produces![0]));
+    // The path as the stage directive names it, from the project root.
+    const redo = tool(p, "state", [
+      "reuse-artifact", "nfr-requirements", "--decision", "redo",
+      "--artifacts", relative(p, document).replaceAll("\\", "/"),
+    ]);
+    expect(redo.status, redo.out).toBe(0);
+    expect(redoAlphaDocument(p, false)?.rechecked).toMatchObject({ approved_before: true, redone: true });
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  // The person's Redo on re-entry reopens the approved Unit (jump reopen
+  // --via redo withdraws its approval), so the redone Unit gets the ordinary
+  // first approval question, with no re-check line.
+  test("a redo through jump reopen --via redo asks the ordinary approval question", () => {
+    const p = policyFixture("classic", "off (set by you)");
+    buildReviewed(p, "alpha", undefined, true);
+    approve(p, "alpha");
+    const reopened = tool(p, "jump", [
+      "reopen", "--target", "nfr-requirements", "--stages", stages.slice(1).join(","),
+      "--units", "alpha", "--via", "redo", "--scope", "classic",
+    ]);
+    expect(reopened.status, reopened.out).toBe(0);
+    expect(next(p)).toMatchObject({ stage: "nfr-requirements", unit: "alpha", artifact_reuse: { decision: "redo", unit: "alpha" } });
+    for (const slug of stages.slice(1)) {
+      cover(p, "alpha", [slug], false);
+      if (slug === "nfr-requirements") editAlphaDocument(p, "The redone requirements.");
+      // The reopened step is a new attempt: its reviews count from one again.
+      const reviewed = reviewThroughLog(p, [
+        "review", "--stage", slug, "--reviewer", findStageBySlug(slug)!.reviewer!, "--unit", "alpha", "--iteration", "1",
+      ]);
+      expect(reviewed.status, reviewed.out).toBe(0);
+      appendAuditEntry("UNIT_COMPLETED", {
+        Stage: slug, Unit: "alpha", "Run floor": latestMainWorkflowStageRunFloorForProject(p, slug, true, "alpha"),
+      }, p);
+    }
+    const checkpoint = next(p).construction_checkpoint;
+    expect(checkpoint, JSON.stringify(checkpoint)).toMatchObject({ unit: "alpha", ready: true });
+    expect(checkpoint?.rechecked).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  for (const policy of ["off (set by you)", "relaxed (set by you)"]) {
+    test(`a hand edit of an approved Unit's document asks nothing (${policy.split(" ")[0]})`, () => {
+      const p = policyFixture("classic", policy);
+      buildReviewed(p, "alpha", undefined, true);
+      approve(p, "alpha");
+      editAlphaDocument(p, "A hand edit after the approval.");
+      const beat = next(p);
+      expect(beat, JSON.stringify(beat)).toMatchObject({ stage: "functional-design", unit: "beta" });
+      expect(beat.construction_checkpoint).toBeUndefined();
+      expect(approved(p, "alpha")).toBe(true);
+    }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+  }
 
   // A review of a Unit stage whose reviewed document moved is its one recovery
   // review under every Guard Policy: relaxed and off accept the change, and

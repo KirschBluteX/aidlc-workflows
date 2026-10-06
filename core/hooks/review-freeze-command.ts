@@ -1,4 +1,5 @@
 import { statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 // The file-writing tools whose targets the freeze inspects. Read-only tools
 // never invalidate a receipt.
@@ -1506,17 +1507,254 @@ function isNullDevice(raw: string): boolean {
   return raw === "/dev/null" || (process.platform === "win32" && /^nul$/i.test(raw));
 }
 
+// Commands that change the shell's working directory for the commands after them.
+export const SHELL_DIRECTORY_CHANGES = new Set(["cd", "pushd", "chdir", "set-location", "sl"]);
+const MAX_SHELL_ROOTS = 64;
+
+// The directories a bare `cd` or a leading `~` or $HOME names: HOME, else the
+// OS home. PowerShell on Windows takes them from its user profile instead
+// (USERPROFILE, or HOMEDRIVE and HOMEPATH), never from HOME.
+function shellHomes(powerShell: boolean): string[] {
+  if (!powerShell || process.platform !== "win32") return [resolve(process.env.HOME || homedir())];
+  const homes = [process.env.USERPROFILE || homedir()];
+  if (process.env.HOMEDRIVE && process.env.HOMEPATH) homes.push(process.env.HOMEDRIVE + process.env.HOMEPATH);
+  return [...new Set(homes.map((home) => resolve(home)))];
+}
+
+// A word's readings with a leading `~`, `$HOME` or `${HOME}` expanded to each
+// of shellHomes, or none. The quoting is gone by the time a word gets here and
+// a quoted `~` is not expanded, so callers keep the literal reading of a `~`
+// word beside these; a `$HOME` word has no literal reading (a word with `$`
+// resolves to none). A PowerShell word also takes `\` as a separator and its
+// variable names in any case. No other variable is read from the hook's
+// environment: an `$env:` word is a computed word, like `$X`.
+function homeReadings(word: string, powerShell = false): string[] {
+  const text = powerShell ? word.replaceAll("\\", "/") : word;
+  const lead = (powerShell ? /^(?:~|\$HOME|\$\{HOME\})/i : /^(?:~|\$HOME|\$\{HOME\})/).exec(text);
+  if (lead === null) return [];
+  const rest = text.slice(lead[0].length);
+  if (rest !== "" && !rest.startsWith("/")) return [];
+  return shellHomes(powerShell).map((home) => resolve(join(home, rest)));
+}
+
+// A segment with its redirections removed, so `cd 2>/dev/null` is read as a
+// bare `cd`. Quotes are respected: a `>` inside a quoted word is not one.
+function withoutRedirections(segment: string): string {
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+    if (quote !== null) {
+      out += ch;
+      if (ch === quote) quote = null;
+      else if (ch === "\\" && quote === '"') out += segment[++i] ?? "";
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch + (segment[++i] ?? "");
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch !== ">" && ch !== "<") {
+      out += ch;
+      continue;
+    }
+    // A descriptor number or `&` written against the operator belongs to it.
+    out = out.replace(/(?:^|(?<=\s))(?:\d+|&)$/, "");
+    while (">|&<".includes(segment[i + 1] ?? "x")) i++;
+    while (segment[i + 1] === " " || segment[i + 1] === "\t") i++;
+    // The operator's word, quotes and all.
+    let wordQuote: "'" | '"' | null = null;
+    while (i + 1 < segment.length) {
+      const next = segment[i + 1];
+      if (wordQuote === null && (/\s/.test(next) || ";|&<>".includes(next))) break;
+      i++;
+      if (wordQuote !== null) {
+        if (next === wordQuote) wordQuote = null;
+      } else if (next === "'" || next === '"') {
+        wordQuote = next;
+      } else if (next === "\\") {
+        i++;
+      }
+    }
+    out += " ";
+  }
+  return out;
+}
+
 /**
- * Concrete filesystem targets of a mutation-capable shell command. When
- * `rawWords` is given it also receives every target word as written, before
- * resolution, including the words resolution drops ($VAR, globs). A command
- * `shell` names as PowerShell is read as PowerShell (see readPowerShell).
+ * The directories the shell can be in when the command's writes run: `cwd`,
+ * and each literal `cd`/`pushd`/`chdir`/`Set-Location` target resolved from
+ * every directory collected anywhere in the command. A bare `cd` or `chdir`
+ * (options and redirections aside) and a leading `~`, `$HOME` or `${HOME}`
+ * name $HOME (see shellHomes). The order of the segments, loops, functions, subshells and
+ * pipelines is not modelled, so a write can also be read from a directory it
+ * never runs in. A computed target ($VAR, glob), `cd -`, `pushd`'s stack
+ * operands (`+1`; bash's `cd +1` names a directory) and `pushd -n` add nothing. Past the cap the oldest collected directories are
+ * dropped, never `cwd`, a home or the newest, so an absolute `cd` late in a
+ * long command still counts. A command `shell` names as PowerShell is read
+ * as PowerShell: `Set-Location` and `Push-Location` (and their aliases) by
+ * their -Path, -LiteralPath or first positional value, a `\` as a separator,
+ * and a bare Set-Location names its homes; `~`, `$HOME` and `${HOME}` there
+ * take either separator (see homeReadings).
+ */
+export function shellDirectoryRoots(
+  command: string,
+  cwd = process.cwd(),
+  shell: CommandShell = "posix",
+): string[] {
+  const homes = shellHomes(shell === "powershell");
+  const roots = [resolve(cwd)];
+  const pinned = new Set(roots);
+  const add = (dir: string, pin = false) => {
+    if (pin) pinned.add(dir);
+    const at = roots.indexOf(dir);
+    if (at === 0) return;
+    if (at > 0) roots.splice(at, 1);
+    roots.push(dir);
+    while (roots.length - pinned.size > MAX_SHELL_ROOTS) {
+      const oldest = roots.findIndex((root) => !pinned.has(root));
+      if (oldest < 0) break;
+      roots.splice(oldest, 1);
+    }
+  };
+  // A literal operand is read from every directory collected so far.
+  const change = (operand: string) => {
+    const next = new Set<string>();
+    for (const root of roots) {
+      const dir = normalizeShellTarget(operand, root);
+      if (dir) next.add(dir);
+    }
+    for (const reading of homeReadings(operand, shell === "powershell")) next.add(reading);
+    for (const dir of next) add(dir, homes.includes(dir));
+  };
+  if (shell === "powershell") {
+    for (const operand of powerShellLocationChanges(command, 0)) {
+      if (operand === null) for (const home of homes) add(home, true);
+      else change(operand);
+    }
+    return roots;
+  }
+  for (const move of shellDirectoryChanges(command)) {
+    if (typeof move === "object") change(move.operand);
+    else if (move === "home") for (const home of homes) add(home, true);
+  }
+  return roots;
+}
+
+/**
+ * Where each directory change (a SHELL_DIRECTORY_CHANGES name) in a POSIX
+ * command moves the shell, in the order written, read with its redirections
+ * removed, so `cd 2>/dev/null dir` moves to `dir`. Runtime integrity's
+ * audit-trail pass reads directory changes through this too.
+ */
+export function shellDirectoryChanges(command: string): DirectoryChange[] {
+  const out: DirectoryChange[] = [];
+  for (const segment of shellCommandSegments(command)) {
+    const invocation = shellInvocation(shellWords(withoutRedirections(segment)));
+    if (invocation && SHELL_DIRECTORY_CHANGES.has(invocation.name.toLowerCase())) {
+      out.push(directoryChange(invocation.name, invocation.args));
+    }
+  }
+  return out;
+}
+
+// Where a POSIX directory change (a SHELL_DIRECTORY_CHANGES name) moves the
+// shell: to a literal operand, to $HOME (a bare `cd` or `chdir`), nowhere
+// (`pushd -n`), or to a directory the command cannot see (`cd -`, pushd's
+// stack, a bare `pushd`). A word after `--` is the operand, `-` aside, which
+// is still $OLDPWD. Only pushd reads +N as a stack entry in bash, whose cd
+// takes it as a directory (zsh's cd reads its stack: the directory reading
+// then only adds a candidate).
+export type DirectoryChange = { operand: string } | "home" | "stay" | "unknown";
+
+function directoryChange(name: string, args: string[]): DirectoryChange {
+  const command = name.toLowerCase();
+  const end = args.indexOf("--");
+  const options = end >= 0 ? args.slice(0, end) : args;
+  const pushd = command === "pushd";
+  if (pushd && options.includes("-n")) return "stay";
+  const operand = end >= 0
+    ? args[end + 1]
+    : args.find((arg) => !arg.startsWith("-") && !(pushd && /^\+\d*$/.test(arg)));
+  if (operand === "-") return "unknown";
+  if (operand !== undefined) return { operand };
+  const previous = options.some((arg) => /^[+-]\d*$/.test(arg));
+  return !previous && (command === "cd" || command === "chdir") ? "home" : "unknown";
+}
+
+// How Set-Location and Push-Location bind the directory they move to.
+const LOCATION_CHANGE: CmdletWrite = {
+  positional: [["path", "literalpath"]],
+  paths: ["path", "literalpath"],
+  valued: ["stackname"],
+  switches: ["passthru"],
+  aliases: { pspath: "literalpath", lp: "literalpath" },
+  pipelinePath: false,
+};
+const POWERSHELL_LOCATION_COMMANDS: Record<string, "set-location" | "push-location"> = {
+  "set-location": "set-location",
+  cd: "set-location",
+  chdir: "set-location",
+  sl: "set-location",
+  "push-location": "push-location",
+  pushd: "push-location",
+};
+
+// The directory operands of a PowerShell command line's location changes, in
+// groups too, with `\` read as a separator; null for a bare Set-Location,
+// read as each of shellHomes. `-` and `+` (the location history) add nothing.
+function powerShellLocationChanges(command: string, depth: number): Array<string | null> {
+  if (depth > 8) return [];
+  const nested: string[] = [];
+  const out: Array<string | null> = [];
+  for (const { name, args } of readPowerShell(command, nested).commands) {
+    const location = name === null || !Object.hasOwn(POWERSHELL_LOCATION_COMMANDS, name)
+      ? null
+      : POWERSHELL_LOCATION_COMMANDS[name];
+    if (location === null) continue;
+    // The binding lists a positional path twice (its slot, and every positional).
+    const targets = new Set(cmdletWriteTargets(LOCATION_CHANGE, args, true).targets);
+    if (targets.size === 0 && location === "set-location") out.push(null);
+    for (const target of targets) {
+      if (target !== "-" && target !== "+") out.push(target.replaceAll("\\", "/"));
+    }
+  }
+  for (const inner of nested) out.push(...powerShellLocationChanges(inner, depth + 1));
+  return out;
+}
+
+/**
+ * Concrete filesystem targets of a mutation-capable shell command. A relative
+ * target is resolved from each directory `shellDirectoryRoots` collects, so
+ * `cd .kiro && echo x > hooks/y` names `.kiro/hooks/y`; the reading from `cwd`
+ * stays among them. When `rawWords` is given it also
+ * receives every target word as written, before resolution, including the
+ * words resolution drops ($VAR, globs). A command `shell` names as
+ * PowerShell is read as PowerShell (see readPowerShell).
  */
 export function shellWriteTargets(
   command: string,
   cwd = process.cwd(),
   rawWords?: string[],
   shell: CommandShell = "posix",
+): string[] {
+  const out = new Set<string>();
+  shellDirectoryRoots(command, cwd, shell).forEach((root, index) => {
+    for (const target of shellWriteTargetsFrom(command, root, index === 0 ? rawWords : undefined, shell)) out.add(target);
+  });
+  return [...out];
+}
+
+function shellWriteTargetsFrom(
+  command: string,
+  cwd: string,
+  rawWords: string[] | undefined,
+  shell: CommandShell,
 ): string[] {
   const powerShell = shell === "powershell";
   // PowerShell's file system provider takes \ as a separator on every host.
@@ -1532,6 +1770,7 @@ export function shellWriteTargets(
     rawWords?.push(raw);
     const target = resolveTarget(raw);
     if (target) out.push(target);
+    out.push(...homeReadings(raw, powerShell));
   };
   const isDirectory = (raw: string | undefined): boolean => {
     if (!raw) return false;

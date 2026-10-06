@@ -80,6 +80,7 @@ import {
   guardRecoveryAnswerAdmits,
   guardRecoveryRecordWorkOpen,
   PLAN_APPROVAL_ASK_TYPE,
+  guardStandAsideSpeaks,
   guardStoodAsideLine,
   harnessDir,
   normalizeDriveLetter,
@@ -597,12 +598,9 @@ function authorityRemedy(
       return "The person is editing the plan files themselves: leave those files to them. When they say " +
         `they are done, run ${nextOnItsOwn()}, and follow the step it prints.`;
     }
-    return (
-      "The plan is waiting for the person to approve it. Show them the question from the last `next` and end " +
-      "the turn; when they reply, record the choice they made (the stage's `log answer` step), then run " +
-      `${nextOnItsOwn()}. Nothing is built until then. Once they have replied, only the asked plan's own plan ` +
-      "and test instructions can change, for what they asked."
-    );
+    // Some hosts show this refusal to the person as written, so it is only their
+    // sentence; the agent's steps for it are in the skill's refusal clause.
+    return "Nothing is built or changed while the plan waits for your approval.";
   }
   const stands = standing === null
     ? ""
@@ -2082,9 +2080,12 @@ async function evaluate(
     return 2;
   };
   // `lead` false: the reason is already a whole refusal that says what cannot happen.
-  const refuseExecutionIneligible = (reason: string, lead = true): number => {
+  // `settingNote` false: a question waiting on the person, where the setting is not in play.
+  const refuseExecutionIneligible = (reason: string, lead = true, settingNote = true): number => {
     process.stderr.write(
-      `${lead ? "Code Generation cannot start: " : ""}${oneLine(reason).trim().replace(/\.*$/, ".")} The plan-approval setting is unchanged.\n`,
+      `${lead ? "Code Generation cannot start: " : ""}${oneLine(reason).trim().replace(/\.*$/, ".")}${
+        settingNote ? " The plan-approval setting is unchanged." : ""
+      }\n`,
     );
     return 2;
   };
@@ -2404,7 +2405,9 @@ async function evaluate(
       // supplies a missing directive, target, or approval. Those refusals say
       // what they say with the fence on, so each names the step that ends it.
       if (authorityFailure) {
-        return refuseExecutionIneligible(authorityRemedy(authorityFailure, standing, asked));
+        // The plan question is open: the same words as with the fence on.
+        const waiting = authorityFailure === PLAN_APPROVAL_ASK_OPEN;
+        return refuseExecutionIneligible(authorityRemedy(authorityFailure, standing, asked), !waiting, !waiting);
       }
       if (verdict.mentioned.length === 0) {
         return refuseExecutionIneligible(refusalProse(null), false);
@@ -2460,7 +2463,9 @@ async function evaluate(
       if (!recorded) {
         recordHookDrop(projectDir, HOOK_NAME, `GUARD_STOOD_ASIDE row not recorded (audit ledger busy or not writable): ${detail}`);
       }
-      writeGuardStoodAside(guardStoodAsideLine("plan-approval", gate.source, detail, recorded));
+      if (guardStandAsideSpeaks(gate)) {
+        writeGuardStoodAside(guardStoodAsideLine("plan-approval", gate.source, detail, recorded));
+      }
       return 0;
     }
   }
