@@ -303,33 +303,29 @@ describe("t325 atomic team Unit claims", () => {
     "incident-response", "performance-validation", "deployment-execution",
     "feedback-optimization",
   ].join(",");
-  test("plan changes see an active claim published after this clone was created", () => {
+  // #1401: the person's plan change goes through whatever another clone
+  // holds, and no network read can stop it.
+  test("a plan change goes through while another clone holds a claim published after this clone was made", () => {
     const { remote } = makeSeed();
     const planner = clone(remote, "planner");
     const owner = clone(remote, "owner");
     const claimed = run(UNIT, ["claim", "alpha", "--team", "owner"], owner);
     expect(claimed.status, claimed.out).toBe(0);
+    const changed = run(UTILITY, ["recompose", "--skip", removableStages], planner);
+    expect(changed.status, changed.out).toBe(0);
+    expect(readFileSync(seededStateFile(planner), "utf8")).toContain("- [ ] nfr-requirements \u2014 SKIP");
+    // Nothing was fetched to decide it.
     expect(git(planner, ["for-each-ref", "--format=%(refname)", "refs/remotes/origin/claim/"]))
       .toBe("");
-    const before = readFileSync(seededStateFile(planner), "utf8");
-    const audit = readAllAuditShards(planner);
-    const changed = run(UTILITY, ["recompose", "--skip", removableStages], planner);
-    expect(changed.status, changed.out).toBe(1);
-    expect(changed.out).toContain("claimed or merging");
-    expect(readFileSync(seededStateFile(planner), "utf8")).toBe(before);
-    expect(readAllAuditShards(planner)).toBe(audit);
   });
-  test("plan changes fail closed when the remote claim registry cannot be read", () => {
+  test("a plan change goes through when the remote cannot be reached", () => {
     const { remote } = makeSeed();
     const planner = clone(remote, "offline-planner");
     git(planner, ["remote", "set-url", "origin", join(planner, "missing-remote")]);
-    const before = readFileSync(seededStateFile(planner), "utf8");
-    const audit = readAllAuditShards(planner);
     const changed = run(UTILITY, ["recompose", "--skip", removableStages], planner);
-    expect(changed.status, changed.out).toBe(1);
-    expect(changed.out).toContain("Unit claim registry read failed");
-    expect(readFileSync(seededStateFile(planner), "utf8")).toBe(before);
-    expect(readAllAuditShards(planner)).toBe(audit);
+    expect(changed.status, changed.out).toBe(0);
+    expect(changed.out).not.toContain("claim registry");
+    expect(readFileSync(seededStateFile(planner), "utf8")).toContain("- [ ] nfr-requirements \u2014 SKIP");
   });
   test("a fresh clone can adopt the checked-out live claim and publish", () => {
     const { remote } = makeSeed();
