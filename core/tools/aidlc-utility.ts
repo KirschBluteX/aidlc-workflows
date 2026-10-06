@@ -123,6 +123,7 @@ import {
 import {
   type cachedUnitClaimOverview,
   cachedClaimsForIdentity,
+  remoteClaimsForIdentity,
   localUnitClaimOverviewForIntent,
   main as unitMain,
 } from "./aidlc-unit.ts";
@@ -10714,16 +10715,22 @@ function refuseUnitPlanChange(
   ) return;
   let refusal: string | null;
   try {
-    // A claimant can be working in another checkout, so the local Unit ledger
-    // cannot prove that changing its plan is safe. Inspect local claim refs and
-    // the existing cache without fetching or refreshing either one.
+    // A claimant can be working in another checkout. Keep conservative local
+    // observations and read the remote's current refs before changing the plan.
+    // Neither read refreshes the cache or mutates local claim refs.
     const intentUuid = intentUuidForSelection(projectDir, selection);
     if (isTeamUnitOwnership(before) && intentUuid) {
-      const claimed = [...cachedClaimsForIdentity(projectDir, {
+      const identity = {
         space: selection.space, intentUuid, intentId8: idSuffix(intentUuid),
-      }, true).values()].filter((claim) => claim.status === "claimed");
+      };
+      const claimed = [...cachedClaimsForIdentity(projectDir, identity, true).values()]
+        .filter((claim) => claim.status === "claimed");
       const merging = unitMergeTransactionsForIdentity(projectDir, selection.space, intentUuid)
         .filter((transaction) => transaction.status !== "complete");
+      if (claimed.length === 0 && merging.length === 0) {
+        claimed.push(...[...remoteClaimsForIdentity(projectDir, identity).values()]
+          .filter((claim) => claim.status === "claimed"));
+      }
       if (claimed.length > 0 || merging.length > 0) {
         refusePlanChange(
           "Cannot change the Unit plan while Units are claimed or merging: " +

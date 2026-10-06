@@ -1,7 +1,7 @@
 // covers: function:unitPlanChangeRefusal, function:cachedClaimsForIdentity, subcommand:aidlc-utility:scope-change, subcommand:aidlc-utility:recompose
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { appendAuditEntry } from "../../dist/claude/.claude/tools/aidlc-audit.ts";
 import {
@@ -14,6 +14,7 @@ import {
   findStageBySlug,
   reviewArtifactFingerprint,
   releaseAuditLock,
+  setGuardPolicyLine,
   writeUnitClaimRegistryCache,
   getField,
   latestMainWorkflowStageRunFloorForProject,
@@ -111,6 +112,15 @@ function lifecycle(p: string, event: "UNIT_STARTED" | "UNIT_PAUSED" | "UNIT_RESU
 function gate(p: string, event: "STAGE_AWAITING_APPROVAL" | "STAGE_REVISING" | "GATE_REJECTED" | "GATE_APPROVED", unit = "alpha", scope = "per-stage", slug = stage) {
   appendAuditEntry(event, { Stage: slug, Unit: unit, "Gate Scope": scope }, p);
 }
+function requiredArtifacts(p: string, unit: string, slug = stage): string[] {
+  const node = findStageBySlug(slug)!;
+  return (node.produces ?? []).map((name) => {
+    const path = join(seededRecordDir(p), "construction", unit, slug, artifactFilename(name));
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `# ${name} for ${unit}\n`);
+    return path;
+  });
+}
 function command(p: string, args: string[], tool = join(AIDLC_SRC, "tools", "aidlc-utility.ts")) {
   const result = spawnSync(process.execPath, [tool, ...args, "--project-dir", p], {
     encoding: "utf8", env, timeout: NATIVE_STARTUP_TIMEOUT_MS,
@@ -159,6 +169,8 @@ describe("Unit plan changes use lifecycle and gate authority", () => {
   });
   test("partially completed team work cannot lose pending Units", () => {
     const p = fixture();
+    requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
     lifecycle(p, "UNIT_COMPLETED");
     gate(p, "GATE_APPROVED");
     expect(refusal(p)).toContain("unfinished Unit work");
@@ -174,6 +186,8 @@ describe("Unit plan changes use lifecycle and gate authority", () => {
   });
   test.each(["unit-major", "stage-major"])("solo %s requires every started stage's Units to settle", (iteration) => {
     const p = fixture("solo", iteration);
+    requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
     lifecycle(p, "UNIT_COMPLETED");
     expect(refusal(p)).not.toBeNull();
     lifecycle(p, "UNIT_COMPLETED", "beta");
@@ -467,6 +481,10 @@ describe("wave receipts and remaining compatibility", () => {
     expect(refusal(p)).toBeNull();
     writeFileSync(join(seededRecordDir(p),"construction","alpha",stage,artifactFilename(node.produces![0])),"Changed\n");
     expect(refusal(p)).toContain('Unit "alpha"');
+    for (const policy of ["relaxed", "off"] as const) {
+      putState(p, setGuardPolicyLine(state(p), `${policy} (person)`));
+      expect(refusal(p)).toBeNull();
+    }
   });
   test("solo no-DAG revision keeps the established skip recovery", () => {
     const p=fixture("solo","unit-major",false);
@@ -481,11 +499,37 @@ describe("wave receipts and remaining compatibility", () => {
     const result=unchangedRejection(p,["scope-change","--scope","refactor","--depth","comprehensive"]);
     expect(result).toContain("unreadable");
   });
+  test("topology changes refuse terminated audit events missing a timestamp", () => {
+    const p = fixture();
+    const shard = join(seededAuditDir(p), "damaged.md");
+    mkdirSync(dirname(shard), { recursive: true });
+    writeFileSync(shard, `## Unit Started\n**Event**: UNIT_STARTED\n**Stage**: ${stage}\n**Unit**: alpha\n**Run floor**: unstarted#0\n\n---\n`);
+    expect(refusal(p)).toContain("malformed");
+    expect(unchangedRejection(p, ["scope-change", "--scope", "refactor"]))
+      .toContain("malformed");
+  });
+  test("topology changes refuse terminated Unit events missing an Event field", () => {
+    const p = fixture();
+    const shard = join(seededAuditDir(p), "damaged.md");
+    mkdirSync(dirname(shard), { recursive: true });
+    writeFileSync(shard, `## Unit Started\n**Timestamp**: 2026-09-25T12:00:00Z\n**Stage**: ${stage}\n**Unit**: alpha\n**Run floor**: unstarted#0\n\n---\n`);
+    expect(refusal(p)).toContain("malformed");
+  });
+  test("audit notes and unfinished append tails remain non-event data", () => {
+    const p = fixture();
+    const shard = join(seededAuditDir(p), "notes.md");
+    mkdirSync(dirname(shard), { recursive: true });
+    writeFileSync(shard, "## Note\n**Timestamp**: 2026-09-25T12:00:00Z\nA human note.\n\n---\n" +
+      `## Unit Started\n**Event**: UNIT_STARTED\n**Stage**: ${stage}\n**Unit**: alpha\n`);
+    expect(refusal(p)).toBeNull();
+  });
 });
 
 describe("completed approvals and merge recovery", () => {
   test("completed aggregate cannot conceal partial approvals", () => {
     const p=fixture();
+    requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
     putState(p,setCheckbox(state(p),stage,"completed"));
     gate(p,"GATE_APPROVED","alpha");
     expect(refusal(p)).toContain("unfinished Unit work");
@@ -494,6 +538,8 @@ describe("completed approvals and merge recovery", () => {
   });
   test("fully completed and approved unit-end work remains historical", () => {
     const p=fixture();
+    requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
     let content=setField(state(p),"Unit Gate Rhythm","unit-end");
     for (const node of loadStageGraph().filter(s=>s.phase==="construction")) {
       content=setCheckbox(content,node.slug,"completed");
@@ -551,6 +597,8 @@ describe("routing compatibility beyond explicit completion receipts", () => {
 
   test("all Unit approvals settle a stale aggregate without requiring a projection write", () => {
     const p = fixture();
+    requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
     putState(p, setCheckbox(state(p), stage, "in-progress"));
     for (const unit of ["alpha", "beta"]) {
       lifecycle(p, "UNIT_COMPLETED", unit);
@@ -564,6 +612,33 @@ describe("routing compatibility beyond explicit completion receipts", () => {
     putState(p, skip(state(p), "units-generation"));
     expect(refusal(p, setStageSuffix(state(p), "units-generation", "EXECUTE"))).not.toBeNull();
     expect(unchangedRejection(p, ["scope-change", "--scope", "mvp"])).toContain("Unit DAG");
+  });
+
+  test("stage-level work cannot be orphaned when a stale DAG is re-enabled", () => {
+    const p = fixture("solo", "stage-major");
+    putState(p, skip(setCheckbox(state(p), "functional-design", "completed"), "units-generation"));
+    const path = join(seededRecordDir(p), "construction", stage,
+      artifactFilename(findStageBySlug(stage)!.produces![0]));
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "# In-progress stage-level work\n");
+    expect(refusal(p, setStageSuffix(state(p), "units-generation", "EXECUTE")))
+      .toContain("stage-level artifacts");
+    putState(p, setCheckbox(state(p), stage, "completed"));
+    expect(refusal(p, setStageSuffix(state(p), "units-generation", "EXECUTE")))
+      .toContain("stage-level artifacts");
+  });
+
+  test("approved Unit gates do not hide deleted required artifacts", () => {
+    const p = fixture();
+    const [artifact] = requiredArtifacts(p, "alpha");
+    requiredArtifacts(p, "beta");
+    for (const unit of ["alpha", "beta"]) {
+      lifecycle(p, "UNIT_COMPLETED", unit);
+      gate(p, "GATE_APPROVED", unit);
+    }
+    expect(refusal(p)).toBeNull();
+    unlinkSync(artifact);
+    expect(refusal(p)).toContain("required artifacts");
   });
 
   test("a pending per-stage addition retains the held Unit gate", () => {

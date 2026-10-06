@@ -396,6 +396,15 @@ function currentClaim(
 ): UnitClaimView | null {
   const oid = refTip(projectDir, remote, ref);
   if (!oid) return null;
+  return claimAtOid(projectDir, remote, ref, oid);
+}
+
+function claimAtOid(
+  projectDir: string,
+  remote: string | null,
+  ref: string,
+  oid: string,
+): UnitClaimView {
   ensureObject(projectDir, remote, oid, ref);
   const payload = readPayload(projectDir, oid, { localOnly: true });
   if (!payload) fail(`Unit claim registry payload is invalid at ${ref}.`);
@@ -747,6 +756,39 @@ interface UnitClaimIdentity {
   space: string;
   intentUuid: string;
   intentId8: string;
+}
+
+// A plan mutation must inspect the remote's current refs, not a prior local
+// fetch or cache observation. This read neither updates the registry cache nor
+// changes refs in the caller's checkout. Without a remote, claims are local.
+export function remoteClaimsForIdentity(
+  projectDir: string,
+  identity: UnitClaimIdentity,
+): Map<string, UnitClaimView> {
+  const remote = repositoryRemote(projectDir);
+  const claims = new Map<string, UnitClaimView>();
+  if (!remote) return claims;
+  const prefix = `refs/heads/claim/${identity.intentId8}/`;
+  const listed = git(projectDir, ["ls-remote", "--refs", remote, `${prefix}*`]);
+  if (!listed.ok) {
+    fail(`Unit claim registry read failed: ${listed.stderr.trim() || listed.stdout.trim()}`);
+  }
+  for (const line of listed.stdout.split(/\r?\n/).filter(Boolean)) {
+    const [oid, ref] = line.trim().split(/\s+/, 2);
+    if (!oid || !/^[0-9a-f]{40}$/.test(oid) || !ref?.startsWith(prefix)) {
+      fail("Unit claim registry returned an invalid ref listing.");
+    }
+    const claim = claimAtOid(projectDir, remote, ref, oid);
+    if (claim.payload.space !== identity.space ||
+      claim.payload.intent_uuid !== identity.intentUuid ||
+      claim.payload.intent_id8 !== identity.intentId8 ||
+      claim.payload.claim_ref !== ref ||
+      claim.unit !== ref.slice(prefix.length)) {
+      fail(`Unit claim registry payload does not match ${ref}.`);
+    }
+    claims.set(claim.unit, claim);
+  }
+  return claims;
 }
 
 // Local refs and cached observations only; never fetch or refresh the cache.

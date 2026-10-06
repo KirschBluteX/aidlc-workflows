@@ -13779,6 +13779,7 @@ export function parseAuditShardEvents(
   shard: string,
   shardIndex: number,
   copied: ReadonlySet<number> = new Set(),
+  malformedBlocks?: number[],
 ): AuditShardEvent[] {
   const rows: AuditShardEvent[] = [];
   const blocks = auditShardBlocks(content);
@@ -13786,6 +13787,16 @@ export function parseAuditShardEvents(
     if (copied.has(pos)) continue;
     const event = auditBlockField(blocks[pos], "Event");
     const timestamp = auditBlockField(blocks[pos], "Timestamp");
+    // A trailing, unfinished append is not yet an event. A terminated block
+    // with event fields but no Event/Timestamp is damaged evidence, however.
+    if (pos < blocks.length - 1 && (!event || !timestamp) && (
+      event !== null || (
+        auditBlockField(blocks[pos], "Stage") !== null &&
+        auditBlockField(blocks[pos], "Unit") !== null &&
+        (auditBlockField(blocks[pos], "Run floor") !== null ||
+          auditBlockField(blocks[pos], "Gate Scope") !== null)
+      )
+    )) malformedBlocks?.push(pos);
     if (!event || !timestamp) continue;
     rows.push({ block: blocks[pos], event, pos, shard, shardIndex, timestamp });
   }
@@ -13830,6 +13841,7 @@ export function readAuditShardEvents(
   intent?: string,
   space?: string,
   unreadableShards?: string[],
+  malformedShards?: string[],
 ): AuditShardEvent[] {
   const shards = auditShards(
     projectDir,
@@ -13840,9 +13852,12 @@ export function readAuditShardEvents(
   // A vanished or refused shard is skipped; growth during read is tolerated.
   const texts = readAuditShardTexts(projectDir, shards, unreadableShards);
   const copied = copiedAuditBlocks(texts, () => knownAuditShardName(projectDir));
-  return texts.flatMap(({ shard, content, shardIndex }, index) =>
-    parseAuditShardEvents(content, shard, shardIndex, copied[index])
-  );
+  return texts.flatMap(({ shard, content, shardIndex }, index) => {
+    const malformedBlocks: number[] = [];
+    const rows = parseAuditShardEvents(content, shard, shardIndex, copied[index], malformedBlocks);
+    for (const pos of malformedBlocks) malformedShards?.push(`${shard}:${pos + 1}`);
+    return rows;
+  });
 }
 
 // The declaration that travels WITH audit text in every read command's output,
@@ -35385,12 +35400,16 @@ export function unitPlanChangeRefusal(
   if (!losesDag && !gainsDag && !blockChanged) return null;
 
   const unreadable: string[] = [];
+  const malformed: string[] = [];
   const rows = readAuditShardEvents(
-    projectDir, selection.intent ?? undefined, selection.space, unreadable,
+    projectDir, selection.intent ?? undefined, selection.space, unreadable, malformed,
   ).sort((a, b) => a.timestamp.localeCompare(b.timestamp) ||
     a.shardIndex - b.shardIndex || a.pos - b.pos);
   if (unreadable.length > 0) {
     return "Cannot verify Unit work because the selected intent's audit history is unreadable. Repair it before changing the Unit plan.";
+  }
+  if (malformed.length > 0) {
+    return "Cannot verify Unit work because the selected intent's audit history has malformed events. Repair it before changing the Unit plan.";
   }
   const dag = resolveBoltDag(projectDir, selection.intent ?? undefined, selection.space);
   if (dag.state === "malformed") {
@@ -35417,17 +35436,36 @@ export function unitPlanChangeRefusal(
   // is settled only when every Unit's authoritative gate is approved.
   const oldDone = team && rhythm === "unit-end" ? unitEndDone : oldBlock.every(terminal);
   const contextChanges = losesDag || gainsDag;
+  const keepChangedWaveCompletions = constructionCheckpointsApply(before) ||
+    guardPolicyAcceptsChanges(projectDir, before, {
+      selection: { intent: selection.intent ?? undefined, space: selection.space },
+    });
   let aggregateRefusal: string | null = null;
 
   for (const stage of loadStageGraph().filter((s) => s.phase === "construction" && isPerUnitStage(s))) {
-    const dropped = effectivePlanAction(stage.slug, oldScope, before) === "EXECUTE" &&
+    const selectedBefore = effectivePlanAction(stage.slug, oldScope, before) === "EXECUTE";
+    const dropped = selectedBefore &&
       effectivePlanAction(stage.slug, newScope, after) !== "EXECUTE";
-    const affected = dropped || (contextChanges && oldBlock.includes(stage.slug));
+    const affected = dropped || (contextChanges && selectedBefore);
+    if (affected && gainsDag) {
+      // A stage-level file cannot satisfy the new per-Unit paths, even if its
+      // aggregate checkbox was already completed before this plan change.
+      const stageLevelFiles = reviewArtifactEntries(projectDir, stage, undefined, {
+        selection, boltDag: dag, stateContent: before,
+      }) ?? [];
+      if (stageLevelFiles.some((entry) =>
+        entry.logicalPath.startsWith(`${stage.phase}/${stage.slug}/`) &&
+        entry.path !== null && isRegularFile(entry.path))) {
+        return `Stage "${stage.slug}" has stage-level artifacts that the new Unit plan would orphan. Keep the current plan or use the approved recovery flow.`;
+      }
+    }
     const lifecycle = currentUnitLifecycleRows(
       projectDir, "", stage.slug, unitMajor, rows, before, selection,
     );
     const latest = new Map(lifecycle.map((row) => [row.unit, row]));
-    const snapshot = unitLifecycleSnapshot(projectDir, stage.slug, rows, before, { selection });
+    const snapshot = unitLifecycleSnapshot(projectDir, stage.slug, rows, before, {
+      selection, keepChangedWaveCompletions,
+    });
     const aggregateState = checkboxes.get(stage.slug);
     for (const unit of units) {
       if (affected && team && rhythm === "per-stage" &&
@@ -35460,7 +35498,6 @@ export function unitPlanChangeRefusal(
     // Ledger-free upgrades still route from artifact presence. A half-written
     // Unit cannot vanish merely because it predates lifecycle receipts.
     const legacyArtifacts = !snapshot.inUse && !terminal(stage.slug) &&
-      !usesStageLevelPerUnitArtifacts(oldScope, before) &&
       (reviewArtifactEntries(projectDir, stage, undefined, {
         selection, boltDag: dag, stateContent: before,
       }) ?? []).some((entry) => entry.path !== null && isRegularFile(entry.path));
@@ -35468,6 +35505,7 @@ export function unitPlanChangeRefusal(
       unitGateStatus(projectDir, stage.slug, unit, "per-stage", rows, selection) !== "pending"
     );
     let settled = false;
+    let missingArtifactUnit: string | null = null;
     if ((team || !terminal(stage.slug)) && progressed) {
       // A partly completed stage still owns the remaining Units. Completed or
       // conditionally skipped work may leave the plan once every Unit settles.
@@ -35475,14 +35513,31 @@ export function unitPlanChangeRefusal(
         const kind = dag.unitKinds?.get(unit) ?? null;
         if ((stage.produces?.length ?? 0) > 0 &&
           filterProducesByKind(stage.produces_kinds, stage.produces ?? [], kind).length === 0) return true;
+        let complete: boolean;
         if (team) {
           const gateStage = rhythm === "unit-end" ? oldBlock.at(-1) : stage.slug;
-          return gateStage !== undefined &&
+          complete = gateStage !== undefined &&
             unitGateStatus(projectDir, gateStage, unit, rhythm, rows, selection) === "approved";
+        } else {
+          complete = UNIT_TERMINAL_EVENTS.has(latest.get(unit)?.event ?? "");
         }
-        return UNIT_TERMINAL_EVENTS.has(latest.get(unit)?.event ?? "");
+        if (!complete) return false;
+        if (snapshot.skipped.has(unit)) return true;
+        const entries = reviewArtifactEntries(projectDir, stage, unit, {
+          selection, boltDag: dag, stateContent: before,
+        });
+        if ((stage.produces?.length ?? 0) === 0 || !entries ||
+          entries.some((entry) => entry.required &&
+            (entry.path === null || !isRegularFile(entry.path)))) {
+          missingArtifactUnit = unit;
+          return false;
+        }
+        return true;
       });
       if (!settled) {
+        if (missingArtifactUnit !== null) {
+          return `Unit "${missingArtifactUnit}" is missing required artifacts for ${stage.slug}. Restore them before changing the Unit plan.`;
+        }
         return `Stage "${stage.slug}" still has unfinished Unit work. Finish its Unit work and approvals before removing the stage or Units Generation.`;
       }
     }
