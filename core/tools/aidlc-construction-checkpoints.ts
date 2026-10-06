@@ -5,7 +5,7 @@
 import { EXTENDED_SUBPROCESS_TIMEOUT_MS } from "./aidlc-runtime-budget.ts";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, mkdtempSync, openSync, readSync, rmdirSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readSync, rmdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { appendAuditEntryUnlocked } from "./aidlc-audit.ts";
@@ -19,6 +19,7 @@ import {
   type VerificationCommand,
   claimAttemptFields,
   completionCarriesVerifiedReview,
+  reviewRecordNotHere,
   effectivePlanAction,
   eventMatchesClaimAttempt,
   filterProducesByKind,
@@ -130,6 +131,8 @@ export interface ConstructionCheckpoint {
   run_floor: string;
   run_floors: Record<string, string>;
   proof_path: string;
+  /** The proof file, or on a checkout with none the committed verification
+   *  row that stands in for it (no output recorded). */
   verification: ConstructionCheckpointProof | null;
   verification_command: string | null;
   command_authorized: boolean;
@@ -293,6 +296,40 @@ function readProof(root: string, path: string): ConstructionCheckpointProof | nu
   }
 }
 
+// Whether this checkout has no proof file for the Unit at all: the proof
+// folder is not committed, so a fresh clone or another machine has none.
+// Anything at the path (a file, a link, a folder) is a proof that must read.
+function proofFileAbsent(root: string, path: string): boolean {
+  try {
+    lstatSync(recordFileTargetOrThrow(root, path));
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+// What a committed verification row records of its proof.
+type CommittedCheckpointProof = Pick<ConstructionCheckpointProof, "id" | "kind" | "unit" | "fingerprint" |
+  "command_sha256" | "verified" | "evidence_unchanged" | "exit_code" | "signal" | "error" | "finished_at">;
+
+// That record, read the way the proof file is: the row is written with the
+// proof, and Verified true means the check passed with the Unit's evidence
+// unchanged.
+function proofFromVerificationRow(
+  block: string, kind: ConstructionCheckpointKind, unit: string,
+): CommittedCheckpointProof | null {
+  const id = auditBlockField(block, "Verification Id");
+  const fingerprint = auditBlockField(block, "Fingerprint");
+  const commandSha256 = auditBlockField(block, "Command SHA-256");
+  const verified = auditBlockField(block, "Verified") === "true";
+  if (!id || !fingerprint || !commandSha256 || !/^[a-f0-9]{64}$/.test(commandSha256)) return null;
+  return {
+    id, kind, unit, fingerprint, command_sha256: commandSha256, verified, evidence_unchanged: verified,
+    exit_code: auditBlockField(block, "Exit Code") === "0" ? 0 : null, signal: null, error: null,
+    finished_at: verified ? "recorded" : null,
+  };
+}
+
 interface Snapshot {
   result: ConstructionCheckpoint;
   root: string;
@@ -430,8 +467,11 @@ function snapshot(
   const humanRequired = kind === "skeleton" || !autonomous;
   const floors: Record<string, string> = {};
   const evidence: unknown[] = [];
-  if (listing === null) errors.push("The Unit's source boundary cannot be fingerprinted.");
+  // Said after the stages, in this place: under relaxed and off a review that
+  // kept its source binding stands for source that cannot be read here.
+  const unreadableAt = errors.length;
   let sourceStages = 0;
+  let sourceKeptUnread = 0;
   let rereview: ConstructionCheckpoint["rereview"] = null;
   let recheckVerdict: string | null = null;
   let recheckChanged: "code" | "documents" = "code";
@@ -567,14 +607,22 @@ function snapshot(
       // Another Unit's own reviewed build of a path this Unit claims, or any
       // change to its code or documents the Guard Policy accepts, is not a
       // change to this Unit's approved work: its review's binding still holds.
+      // So is source the Guard Policy keeps without a compare: the reviewed
+      // listing not on this machine, the Unit's list of files changed after
+      // its review, or source that cannot be read here.
       const reviewedSource = review ? auditBlockField(review.block, "Unit Source Fingerprint") : null;
+      const sourceKept = receipts.unitSourceKept.has(unit) && acceptsChanges();
       if (
-        stage.workspace_requires && source !== null && reviewedSource !== null &&
-        reviewedSource !== source && (
-          receipts.unitSourceAttributed.has(unit) ||
-          (receipts.unitSourceMoved.has(unit) && acceptsChanges())
+        stage.workspace_requires && reviewedSource !== null && reviewedSource !== source && (
+          sourceKept || (source !== null && (
+            receipts.unitSourceAttributed.has(unit) ||
+            (receipts.unitSourceMoved.has(unit) && acceptsChanges())
+          ))
         )
-      ) source = reviewedSource;
+      ) {
+        if (source === null && listing === null) sourceKeptUnread++;
+        source = reviewedSource;
+      }
       const reviewedArtifact = review ? auditBlockField(review.block, "Artifact Fingerprint") : null;
       if (
         artifact !== null && reviewedArtifact !== null && reviewedArtifact !== artifact &&
@@ -582,7 +630,11 @@ function snapshot(
       ) artifact = reviewedArtifact;
       if (
         !review || !receipts.unitVerdicts.has(unit) ||
-        !binding || !completionCarriesVerifiedReview(projectDir, binding, review.block) ||
+        !binding || (
+          !completionCarriesVerifiedReview(projectDir, binding, review.block) &&
+          // A written review not on this machine keeps its recorded verdict.
+          !(acceptsChanges() && reviewRecordNotHere(projectDir, binding, review.block))
+        ) ||
         receipts.unitPending.has(unit) || receipts.openBoltUnits.has(unit) ||
         reviewFloor !== floor ||
         auditBlockField(review.block, "Artifact Fingerprint") !== artifact ||
@@ -596,10 +648,14 @@ function snapshot(
       ) {
         errors.push(`${slug}: current artifact/source-bound terminal review evidence is required.`);
         // Only the reviewed code or documents moved (no review is waiting):
-        // the one recovery review re-checks them.
+        // the one recovery review re-checks them. So does readable code the
+        // review no longer binds (its list of files changed, or the listing it
+        // saw is not on this machine).
         const moved = receipts.unitSourceMoved.get(unit) ??
-          (review && auditBlockField(review.block, "Artifact Fingerprint") !== artifact
-            ? receipts.unitStaleProgress.get(unit) : undefined);
+          (review && (
+            auditBlockField(review.block, "Artifact Fingerprint") !== artifact ||
+            (receipts.unitStale.has(unit) && listing !== null)
+          ) ? receipts.unitStaleProgress.get(unit) : undefined);
         if (review && moved && !moved.recoverySpent && !receipts.unitPending.has(unit)) {
           const reviewer = stage.reviewer!;
           const iteration = moved.nextIteration;
@@ -655,6 +711,9 @@ function snapshot(
       review_verdict: review ? auditBlockField(review.block, "Verdict") : null,
     });
   }
+  if (listing === null && (sourceStages === 0 || sourceKeptUnread < sourceStages)) {
+    errors.splice(unreadableAt, 0, "The Unit's source boundary cannot be fingerprinted.");
+  }
   if (sourceStages === 0) errors.push("No applicable stage supplies the Unit's source manifest.");
   if (errors.length !== 1) rereview = null;
   const fingerprint = digest({
@@ -666,6 +725,7 @@ function snapshot(
   });
   const proofPath = proofRelativePath(unit, kind);
   const proof = readProof(root, proofPath);
+  const proofFile = proof;
   const verification = onlyLatest(rows.filter((row) =>
     row.event === "CHECKPOINT_VERIFICATION_RECORDED" &&
     auditBlockField(row.block, "Unit") === unit &&
@@ -673,7 +733,10 @@ function snapshot(
     eventMatchesClaimAttempt(projectDir, row.block, unit),
   ));
   const ready = errors.length === 0;
-  const verifiedWith = (commandSha256: string | undefined): boolean => ready && proof !== null &&
+  const verifiedWith = (
+    commandSha256: string | undefined,
+    proof: ReturnType<typeof proofFromVerificationRow> = proofFile,
+  ): boolean => ready && proof !== null &&
     commandSha256 !== undefined &&
     proof.kind === kind && proof.unit === unit &&
     proof.command_sha256 === commandSha256 &&
@@ -687,22 +750,44 @@ function snapshot(
     auditBlockField(verification.block, "Command SHA-256") === commandSha256 &&
     auditBlockField(verification.block, "Verified") === "true";
   const verifiedNow = verifiedWith(shared.verificationCommand?.sha256);
-  const gateApproved = gate?.event === "GATE_APPROVED" &&
+  const gateApprovedWith = (commandSha256: string | undefined): boolean => gate?.event === "GATE_APPROVED" &&
     auditBlockField(gate.block, "Unit") === unit &&
     auditBlockField(gate.block, "Stage") === stages.at(-1) &&
     auditBlockField(gate.block, "Stages") === stages.join(", ") &&
     auditBlockField(gate.block, "Gate Scope") === "unit-end" &&
     auditBlockField(gate.block, "Fingerprint") === fingerprint &&
-    auditBlockField(gate.block, "Verification Command SHA-256") === proof?.command_sha256 &&
+    commandSha256 !== undefined &&
+    auditBlockField(gate.block, "Verification Command SHA-256") === commandSha256 &&
     auditBlockField(gate.block, "Run floor") === floors[stages.at(-1)!] &&
     eventMatchesClaimAttempt(projectDir, gate.block, unit) &&
     (auditBlockField(gate.block, "User Input") === "Approve" ||
       (kind !== "skeleton" && auditBlockField(gate.block, "Autonomous") === "true"));
+  const gateApproved = gateApprovedWith(proof?.command_sha256);
   // A Unit approved under an earlier verification command keeps its approval
   // when the person approves a new command: the new one checks the Units
   // still to be approved.
-  const verified = verifiedNow || (gateApproved && verifiedWith(proof?.command_sha256));
-  const approved = verified && gateApproved;
+  let verified = verifiedNow || (gateApproved && verifiedWith(proof?.command_sha256));
+  let approved = verified && gateApproved;
+  let restored: ConstructionCheckpointProof | null = null;
+  // A checkout with no proof file at all (a fresh clone, another machine):
+  // the committed verification row stands in for it, for a Unit already
+  // approved whose evidence is unchanged since. Nothing is run again.
+  if (!approved && proof === null && verification !== null && proofFileAbsent(root, proofPath)) {
+    const committed = proofFromVerificationRow(verification.block, kind, unit);
+    if (committed && gateApprovedWith(committed.command_sha256) && verifiedWith(committed.command_sha256, committed)) {
+      verified = true;
+      approved = true;
+      // Asked about again, the approval binds to the verification it stands
+      // on. The committed row records no output, so none is shown.
+      restored = {
+        version: 4, ...committed,
+        command_label: shared.verificationCommand?.sha256 === committed.command_sha256
+          ? shared.verificationCommand.label : "",
+        started_at: committed.finished_at ?? "recorded",
+        stdout_bytes: 0, stderr_bytes: 0, stdout_sha256: "", stderr_sha256: "", stdout_tail: "", stderr_tail: "",
+      };
+    }
+  }
   const approvedBefore = gate?.event === "GATE_APPROVED" && auditBlockField(gate.block, "Unit") === unit &&
     auditBlockField(gate.block, "Run floor") === floors[stages.at(-1)!];
   // A re-check of documents during the Unit's build is its usual checkpoint.
@@ -718,7 +803,7 @@ function snapshot(
       verification_command: shared.verificationCommand?.label ?? null,
       command_authorized: shared.verificationCommand !== null,
       run_floor: floors[stages.at(-1)!] ?? "unstarted#0",
-      run_floors: floors, proof_path: `${root}/${proofPath}`, verification: proof,
+      run_floors: floors, proof_path: `${root}/${proofPath}`, verification: proof ?? restored,
       rereview, rechecked,
     },
   };
