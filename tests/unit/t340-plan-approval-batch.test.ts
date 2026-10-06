@@ -177,7 +177,8 @@ describe("t340 exact reviewed Code Generation batch approval", () => {
     const outside = join(f.project, "outside-batches");
     mkdirSync(outside);
     writeFileSync(join(outside, "manifest.json"), readFileSync(f.file));
-    symlinkSync(outside, join(seededRecordDir(f.project), "redirected-batches"));
+    symlinkSync(outside, join(seededRecordDir(f.project), "redirected-batches"),
+      process.platform === "win32" ? "junction" : "dir");
     for (const action of ["decision", "answer"] as const) {
       const result = log(f, action, ["--batch-file", "redirected-batches/manifest.json"]);
       expect(result.code).not.toBe(0);
