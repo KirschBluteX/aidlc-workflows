@@ -214,7 +214,7 @@ describe("the switch goes through and names the Unit work it drops", () => {
 });
 
 describe("the Units carry on per Unit after the switch (#1401)", () => {
-  test.each(["team", "solo"])("%s: next keeps walking the Units Units Generation made", (ownership) => {
+  test.each(["team", "solo"])("%s: next keeps walking the Units that Units Generation made", (ownership) => {
     const p = fixture(ownership);
     gate(p, "STAGE_AWAITING_APPROVAL", "beta");
     switchTo(p);
