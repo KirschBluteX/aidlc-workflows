@@ -10831,13 +10831,6 @@ function handleScopeChange(projectDir: string, flags: Record<string, string>): v
       // stage waiting for approval (a skipped stage holds no open approval).
       const skippedNow: { slug: string; was: string }[] = [];
       if (currentNode && skips(currentSlug) && currentState !== "completed" && currentState !== "skipped") {
-        if (isTeamUnitOwnership(content) && currentNode.phase === "construction" && isPerUnitStage(currentNode)) {
-          die(
-            `Cannot change scope to ${newScope} while ${currentSlug} is the current team Unit stage: ` +
-              `${newScope} skips it, and team routing cannot move Units off a skipped stage. ` +
-              `Finish ${currentSlug} for every Unit first, then change scope.`,
-          );
-        }
         if (currentState !== "in-progress" && currentState !== "revising" && currentState !== "awaiting-approval") {
           skippedNow.push({ slug: currentSlug, was: "it had not started" });
         }

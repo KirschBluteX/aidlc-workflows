@@ -7971,17 +7971,6 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     (currentIsInFlight || currentState === "skipped") &&
     effectivePlanAction(currentSlug, scope, stateContent) === "SKIP"
   ) {
-    const currentNode = nodeForSlug(currentSlug);
-    if (
-      isTeamUnitOwnership(stateContent) &&
-      currentNode?.phase === "construction" &&
-      isPerUnit(currentNode)
-    ) {
-      emit(errorDirective(
-        `Unit Ownership: team cannot route current stage "${currentSlug}": it is not in the active unskipped per-unit Construction block.`,
-      ));
-      return;
-    }
     if (currentState !== "in-progress" && currentState !== "revising" && currentState !== "skipped" && currentState !== "awaiting-approval") {
       emit(errorDirective(
         `Stage "${currentSlug}" is SKIP in the approved workflow plan but its active cursor state is ` +
