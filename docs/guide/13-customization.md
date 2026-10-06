@@ -238,11 +238,12 @@ Precedence is global kill switch (`1`) → valid intent field → scope default 
 `on`. Kill switches can also be recorded with `aidlc config flags --bypass <NAME>`.
 New intents store `Sensors`, `Learnings`, `Summary Confirmation`,
 `Plan Approval`, and `Collaborators` after `Guard Policy` in `aidlc-state.md`, each with a source
-label such as `on (from scope classic)`. For a plan composed for this piece of work, `--status` shows that label as `(from the approved plan)`; the state file keeps the scope. The label reads `set by you` only when
-the human-turn hook applies the message you typed itself: summary confirmation
-or plan approval off typed with no description, plan approval off in your own
+label such as `on (from scope classic)`. For a plan composed for this piece of work, `--status` shows that label as `(from the approved plan)`; the state file keeps the scope. The label reads `set by you` when the
+human-turn hook applies the message you typed itself (summary confirmation or
+plan approval off typed with no description, plan approval off in your own
 words, or a Guard Policy or fence switch, together with the settings typed
-beside it. Sensors, learnings or summary confirmation you type with a request
+beside it), or when the agent turns off a check you asked it to turn off in the
+chat. Sensors, learnings or summary confirmation you type with a request
 (`/aidlc --learnings on build the export`), or before any work exists, also
 read `set by you` on the work that request creates. Any other change, including
 a flag the agent adds to the command that starts new work, is made by a command
@@ -372,7 +373,7 @@ Other code moving after you approved a code plan (a `git pull`, another Unit lan
 
 **How hard the fences hold.** `strict` leaves all five fences up. `relaxed` lowers plan re-approval and review freeze. `off` lowers those two plus state transition and reviewer read scope. No value lowers human presence or claimed-checkout Unit write ownership. A lowered fence still writes an audit row every time it lets something through.
 
-**When the plan itself changes after approval.** For the same Unit or stage target and attempt, edits to the plan, test instructions, or Testing Contract continue without mandatory reapproval under `relaxed` or `off`. Under `strict` those edits reopen approval: the edited plan is asked about again. This is Guard Policy's call alone; the [plan approval](#plan-approval) setting decides only whether a plan is asked about in the first place. The same rule covers updates after Testing Posture, scope, test strategy, or project type changes within the same intent, target, and attempt: refresh the contract and instructions as needed, and continue while the fence stays lowered. The effective fence setting decides; `/aidlc --status` shows it. You can still ask to review the plan again.
+**When the plan itself changes after approval.** For the same Unit or stage target and attempt, edits to the plan, test instructions, or Testing Contract continue without mandatory reapproval under `relaxed` or `off`. Under `strict` those edits reopen approval: the edited plan is asked about again. Either way, until the build starts you see one line saying what changed, such as "Your approved plan changed before the build: step 4 now says ... instead of ...", and saying "go back to the approved plan" puts back the plan, test instructions, and approval you gave. This is Guard Policy's call alone; the [plan approval](#plan-approval) setting decides only whether a plan is asked about in the first place. The same rule covers updates after Testing Posture, scope, test strategy, or project type changes within the same intent, target, and attempt: refresh the contract and instructions as needed, and continue while the fence stays lowered. The effective fence setting decides; `/aidlc --status` shows it. You can still ask to review the plan again.
 
 Initial Plan Approval (while [plan approval](#plan-approval) is on) and other gates remain required. A lowered fence does not mean the edited content was approved: your original answer and approval evidence remain a record of what you actually approved. No reviewer's verdict is changed, no evidence is deleted, and an agent can never answer for you.
 

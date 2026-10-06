@@ -331,7 +331,11 @@ runs out (about two minutes in default mode) it returns no answers,
 which records `QUESTION_UNANSWERED` instead of a `HUMAN_TURN`: the row spends
 any earlier turn, so an answer or approval logged before the person replies
 again is refused, and the hook tells the agent to ask the same question again
-in its reply rather than in the box.
+in its reply rather than in the box. A box that comes back with an answer, on
+Codex or Claude Code, also records one `QUESTION_REPLIED` row per question,
+with the question as shown and the reply as given. That row decides nothing
+and spends no turn. An answer the agent records with `log answer` carries the
+person's latest kept words as `Person Reply`.
 
 ### Shared Characteristics
 
@@ -532,8 +536,8 @@ is always complete. For the same reason a run-stage is retained only when it
 carries its own rules: one that followed rules parts is answered with part one
 again, so a new chat or a resume gets the rules. The Stop-hook probe and a lost
 `continue` race are the exceptions: they retain the CURRENT part with its
-receipt, or the run-stage in hand, so the end-of-turn re-feed names what the
-conductor already holds. Routing is always recomputed, so a paused Unit, a moved
+receipt, or the run-stage in hand, so a `continue` with the receipt the
+conductor already holds picks up where it was. Routing is always recomputed, so a paused Unit, a moved
 gate, or a completed Unit produces its own directive and stale work can never be
 re-issued. Asking the engine what to do twice therefore answers the same thing
 twice and changes nothing, which is what makes that query safe to ask from a hook.
@@ -1029,11 +1033,13 @@ hint. Fresh `next` is the universal reset. Hook marker reads remain fail-open
 for their advisory purpose, and Post/host hooks may read or enrich delivery
 evidence but never authorize replay.
 
-The Stop hook's end-of-turn re-feed names the current part's receipt and never
-repeats the rule text. Hook output is capped near 10 KB on every harness (Claude
-Code 10,000 characters, Codex about 2,500 tokens, Kiro CLI 10,240 bytes, Copilot
-10 KB), so a payload re-feed would be cut or spilled to a file; the engine
-re-serves the current part when the receipt is presented.
+The Stop hook's end-of-turn note never repeats the rule text and names no
+receipt: it is one plain line the person can read. The conductor continues with
+the receipt it holds, and the engine re-serves the current part when that
+receipt is presented; with none, a fresh `next` restarts at part one, which is
+always complete. Hook output is capped near 10 KB on every harness (Claude Code
+10,000 characters, Codex about 2,500 tokens, Kiro CLI 10,240 bytes, Copilot
+10 KB), so a payload re-feed would be cut or spilled to a file.
 
 Upgrade and rollback must be quiescent: replace the engine, library, hooks, and
 generated harness tree together while no AI-DLC command or hook is running.
@@ -1214,7 +1220,7 @@ This is one of the framework's six flow-altering hooks, alongside the five PreTo
 8. **`error` -> deliver once within the retention bound:** The hook fingerprints the active intent UUID, session ID, canonical state digest (the one the no-progress signature uses, so cache-only fields such as `Last Updated` do not count), stage, and bounded message. It keeps the 32 most recently delivered fingerprints in FIFO order under `<record>/.aidlc-engine/stop-hook/error-directive.json` as `{"fingerprints":["<sha256>","..."]}`. A new fingerprint best-effort emits `ERROR_LOGGED` and blocks once with the bounded engine message quoted verbatim. Repeats do not refresh the FIFO: A -> B -> A delivers A once, and interleaved sessions retain their own keys. The 33rd distinct error evicts the oldest; that evicted error can then be delivered and audited again. Locked atomic persistence prevents lost updates across sessions. Fingerprint I/O fails open, and audit failure never changes the decision.
 9. **Unknown kind -> allow:** A kind outside the public 11-value directive union and the hook's internal `rehydrate` sentinel has no safe continuation semantics, so it records a drop and allows the stop.
 10. **Legitimate turn stop -> allow:** If the directive is pending but the conductor is correctly parked on a human, a matching in-flight background subagent, a compose gate, a Resume choice, or a conversational response, the hook allows the stop and records a trace line in `continue-workflow.trace` rather than spamming the nudge; a trace line is a normal decision, so doctor never counts it as a drop. Qualifying evidence includes Esc, a state-bound sessionless Resume marker (`ask` + `waiting`), the current stage checkbox `[?]`/`[R]`, an active team `(stage, Unit)` gate's audit status, an in-progress stage with an unanswered file-backed question, a current-stage `DECISION_RECORDED` with no later `QUESTION_ANSWERED`, a fresh compose marker, a fresh in-flight entry for the current session, or a conversational ending turn. Background and Resume state are session-isolated; autonomous Construction suppresses the applicable waits. Positive-confirmation only: missing, stale, foreign-session, or malformed evidence falls through to the bounded block below. See "Turn-stop carve-outs" below.
-11. **Pending -> block and inject:** For any other known pending directive - `run-stage`, `dispatch-subagent`, `invoke-swarm`, `present-gate`, `print`, or recovery `rehydrate` - it prints `{"decision":"block","reason":<on-task continuation>}`, so the same session resumes with the next move injected. The injected `reason` also names `aidlc-orchestrate park` as the clean-pause alternative, so a conductor that wants to stop a long workflow parks rather than advancing. It also covers the one wait the hook cannot see, a question the conductor showed before recording it: the reason gives the exact `engine log decision` command and says to end the turn without asking again, so the person sees the question once. The reason uses plain words with no hook, section, or engine terms, because the conductor tends to repeat what it is told.
+11. **Pending -> block and inject:** For any other known pending directive - `run-stage`, `dispatch-subagent`, `invoke-swarm`, `present-gate`, `print`, or recovery `rehydrate` - it prints `{"decision":"block","reason":"AI-DLC is carrying on with <stage>."}`, so the same session resumes. The reason is one plain line: the stage by the name status uses, the Unit when one is named, and no stage after a finished Unit's step, a result that moved the work on under unit-major Construction, or missing or stale evidence. It carries no command, slug, or receipt (see the security property below). On the tools that hide the reason from the person (Kiro CLI, opencode and Kiro IDE, read from the installed tool name, `runtimeHarnessName`), one sentence for the conductor follows the line, on its own line: say the line to the person once, on its own line, when it carries on with the work, and record a question it just asked in silence. It reaches the conductor even when the aidlc skill is not in its context, and the session-start context says the same on those tools. What the conductor does with it is in every conductor SKILL ("When AI-DLC carries on by itself") and in the session-start context, which is sent again after a compaction: record a question it showed before recording it with `engine log decision` and end the turn without asking again or saying anything else (the one wait the hook cannot see, so the person sees the question once), `aidlc-orchestrate park` when the person asked to stop, `continue` with the rules receipt it holds, finish a stage whose `run-stage` it still holds and run the `report` built from that directive (its stage, plus `--unit` in team-owned Unit work and `--single` in an isolated run), or run one fresh `next`. Where the tool shows the line to the person the conductor says nothing about it; where the tool hides it (opencode, Kiro IDE, Kiro CLI) the conductor says the line to the person once, word for word, when it carries on with the work (see the security property below). The matcher that keeps an injected line from reading as the person's prompt counts a message only when the whole message is one of the hook's own lines (with or without the conductor's sentence after it), or exactly Codex's `<hook_prompt hook_run_id="stop:...">` wrapper around one (its `&lt;`, `&gt;` and `&amp;` read back), so a person's sentence that starts the same way stays theirs.
 12. **Fail open:** Any unexpected failure (unreadable state, an engine that exits non-zero or returns no parseable directive, malformed stdin) allows the stop and records a drop. Failing open is the only safe failure mode for a hook that can otherwise trap a turn. Failing open never means falling through to a write: the probe path has no write to fall through to, and a barrier violation is one of the non-zero exits this step absorbs.
 
 **Cursor background agents.** The Cursor adapter never invokes this hook for a
@@ -1246,13 +1252,14 @@ four-byte emoji become 500 on both paths, without a replacement character or a
 discarded diagnostic.
 A `report` `done` that carries `workflow_continues` (the step is recorded and
 the workflow goes on) is not delivered as a stop point. If the conductor stops
-there anyway, Stop names a fresh `next` for the stage the workflow moved to,
-within the usual recursion bound, as the shared probe would, and `park` for a
-person who asked to stop there. Under unit-major Construction it names no stage,
+there anyway, Stop names the stage the workflow moved to, within the usual
+recursion bound, as the shared probe would; the conductor's step for that
+line is a fresh `next`, and a person who asked to stop there is parked by the
+SKILL's carrying-on rule. Under unit-major Construction it names no stage,
 because Current Stage stays on the block's first stage while the walk moves
 through each Unit's steps.
 
-**Security property — the `reason` is never an override.** The person sees the reason too (Claude Code shows it as "Stop hook error: ..."), so it is one line: the step that is open and the one sanctioned command the conductor runs next, for example "Requirements Analysis is not finished yet. Next: `bun .claude/tools/aidlc-orchestrate.ts next`.", never an instruction to do something new or out-of-band. What the conductor does when a question of its own is waiting, or the person asked to stop, is in every conductor SKILL ("When your turn is stopped with a note"). The error-specific reason is "The last AI-DLC step stopped on a problem: " followed by the engine message verbatim; it does not instruct `report`, restart the loop, or repeat until `done`. The same property holds for authority: the Stop hook can only ask the conductor to continue. It cannot mint, rotate, or clear Plan Approval evidence.
+**Security property — the `reason` is never an override.** The person on every tool gets the same one line. Claude Code shows the reason to them as "Stop hook error: ...", Codex as "Blocked by hook" followed by the whole reason, and Copilot shows it too, so there the conductor says nothing about it; Cursor, which posts it as a follow-up message in the chat, keeps that rule too. Kiro CLI shows none of a Stop block (no label and no reason; only the agent's own reply appears, and Kiro CLI 2.23 runs that reply straight on from the agent's previous sentence, so the person reads the line joined to it, for example "...for review.AI-DLC is carrying on with Reverse Engineering."), opencode hands it to the agent as a hidden synthetic part, and Kiro IDE drops Stop output, so their SKILL has the conductor say the carrying-on line to the person once, word for word, when it carries on with the work; on Kiro IDE the note does not reach the agent today, so nothing is said there either. On every tool, a question the conductor just asked is recorded and the turn ends with nothing said. So the person's part of the reason is one line that names where the work carries on and no command (on the tools that hide it, one sentence for the conductor follows), for example "AI-DLC is carrying on with Requirements Analysis.", never an instruction to do something new or out-of-band. What the conductor does with it is in every conductor SKILL ("When AI-DLC carries on by itself"). The error-specific reason is "The last AI-DLC step stopped on a problem: " followed by the engine message verbatim; it does not instruct `report`, restart the loop, or repeat until `done`. The same property holds for authority: the Stop hook can only ask the conductor to continue. It cannot mint, rotate, or clear Plan Approval evidence.
 
 **Recursion guard: a stuck Stop-hook block always lets the turn go.** This bound is the Stop hook's own. A pre-tool guard that keeps refusing the agent's calls is a different failure that this bound does not cover; see the [recovery playbook](../guide/facilitator-guide.md#recovery-playbook). A Stop-hook block that re-fires forever is the one way this hook could trap a turn, so recursion is bounded two ways, both native:
 
@@ -1733,7 +1740,7 @@ The audit trail (the intent's `audit/` shards) uses the event taxonomy defined i
 | **Phase** | 4 | `PHASE_STARTED`, `PHASE_COMPLETED`, `PHASE_VERIFIED`, `PHASE_SKIPPED` | `aidlc-utility.ts intent-create`; lifecycle outcomes reported through `aidlc-orchestrate.ts` |
 | **Stage** | 6 | `STAGE_STARTED`, `STAGE_AWAITING_APPROVAL`, `STAGE_REVISING`, `STAGE_COMPLETED`, `STAGE_SKIPPED`, `STAGE_JUMPED` | `aidlc-orchestrate.ts report` (internal state emitters), `aidlc-jump.ts` |
 | **Initialization** | 3 | `WORKSPACE_SCAFFOLDED`, `WORKSPACE_SCANNED`, `WORKSPACE_INITIALISED` | `aidlc-utility.ts intent-create` |
-| **Interaction** | 11 | `DECISION_RECORDED`, `GATE_APPROVED`, `GATE_REJECTED`, `QUESTION_ANSWERED`, `QUESTION_UNANSWERED`, `SUMMARY_CONFIRMATION_RECORDED`, `PLAN_APPROVAL_RECORDED`, `PLAN_APPROVAL_SKIPPED`, `REVIEW_REQUESTED`, `REVIEW_COMPLETED`, `PIPELINE_LINK_COMPLETED` | `aidlc-log.ts`, `aidlc-state.ts`, `aidlc-plan-approval-ask.ts`, `aidlc-record-human-turn.ts` (hook) |
+| **Interaction** | 12 | `DECISION_RECORDED`, `GATE_APPROVED`, `GATE_REJECTED`, `QUESTION_ANSWERED`, `QUESTION_REPLIED`, `QUESTION_UNANSWERED`, `SUMMARY_CONFIRMATION_RECORDED`, `PLAN_APPROVAL_RECORDED`, `PLAN_APPROVAL_SKIPPED`, `REVIEW_REQUESTED`, `REVIEW_COMPLETED`, `PIPELINE_LINK_COMPLETED` | `aidlc-log.ts`, `aidlc-state.ts`, `aidlc-plan-approval-ask.ts`, `aidlc-record-human-turn.ts` (hook) |
 | **Navigation** | 9 | `SCOPE_CHANGED`, `SCOPE_DETECTED`, `DEPTH_CHANGED`, `TEST_STRATEGY_CHANGED`, `REVIEW_CLASS_CHANGED`, `RECOMPOSED`, `WORKSPACE_RECLASSIFIED`, `SCOPE_SAVED`, `PLUGIN_SELECTION_CHANGED` | `aidlc-utility.ts` |
 | **Guard Policy** | 5 | `GUARD_POLICY_SET`, `CHANGE_CONTROL_SET` (its retired name, read only), `CHANGE_ACCEPTED`, `GUARD_RESTORED`, `GUARD_STOOD_ASIDE` | `aidlc-utility.ts` builds `GUARD_POLICY_SET` batches for `config-change` / `scope-change` and the `GUARD_RESTORED` row for a fence switched back on, including an override above the policy word; `aidlc-lib.ts` observes effective memory changes through `appendGuardPolicySetRow`, records accepted changes at the three governed checkpoints, and writes `GUARD_STOOD_ASIDE` from `recordGuardStoodAside` when a fence stands aside |
 | **Ceremony** | 1 | `CEREMONY_SET` | `aidlc-utility.ts` builds changed-setting rows for `config-change` / `scope-change`, appended together through `appendAuditEntries` before the state write |
@@ -1962,7 +1969,8 @@ A memory layer's `Mode: strict` refuses an explicit `--guard-policy relaxed` or
 scope change, and names the memory file. Explicit strict and unrelated settings
 remain allowed. `review adversarial` stores an empty `Review Override`; explicit
 Guard Policy choices store `<value> (set by you)`; a ceremony choice stores
-`<value> (set by you)` when the hook applies the person's typed switch and
+`<value> (set by you)` when the hook applies the person's typed switch or the
+setter turns off a check the person asked in the chat to turn off, and
 `<value> (set by a command)` otherwise, never relabeling an identical
 `set by you` line; and a fence switch stores the `Guards Off` or `Guards On` line. An `on` override can raise a
 policy-lowered fence and records `GUARD_RESTORED`. Scope defaults retain their
@@ -2074,6 +2082,15 @@ the structured contract plus methodology-specific plan profile.
 `reply [--session <id>]` prints, read-only, whether the person has replied to the
 pending Plan Approval question yet, so the conductor knows whether to read their
 reply and record their choice or to wait.
+`restore --unit <unit>` (or `--stage-level`) writes back the plan, test
+instructions and questions file the person approved in this stage attempt (the
+engine keeps a copy beside the approval receipt) and prints "Back to the plan you
+approved."; the conductor runs it when the person asks to go back to the approved
+plan, and the plan-approval guard lets it through before approval and while a
+plan waits, since it writes back only what the person approved. Until the build starts, an approved plan or test instructions that changed
+on disk are named in one line ("Your approved plan changed before the build: step
+4 now says ... instead of ..."): in `next`'s `change_notices` under a lowered Guard
+Policy, in the re-asked question's `plan_approval.note` under strict.
 `fingerprint --unit <unit>` and `verify --unit <unit>` bind and check per-unit
 evidence. The fingerprint covers a stable projection of the plan (a terminal
 `## Review` appendix erased, task markers reset, whitespace normalized), the

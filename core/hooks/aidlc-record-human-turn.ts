@@ -271,6 +271,48 @@ function pickedGateLabel(text: string, picker: PlanApprovalPickerQuestion | unde
   return GATE_PICK_LABELS.includes(label.toLowerCase()) ? label : "";
 }
 
+// What a question box carried back, one entry per question it asked: the
+// question as shown and the reply as given, verbatim. Claude Code keys each
+// reply by its question; Codex keys it by the question's id, with a list of
+// picks (its adapter passes the box's reply as picker_reply). Nothing here
+// reads meaning into the reply.
+function pickerReplies(input: string): Array<{ question: string; reply: string }> {
+  try {
+    const payload = JSON.parse(input) as {
+      tool_input?: unknown; toolInput?: unknown; tool_response?: unknown; toolResponse?: unknown; picker_reply?: unknown;
+    };
+    let response = payload.picker_reply ?? payload.tool_response ?? payload.toolResponse;
+    if (typeof response === "string") response = JSON.parse(response);
+    const answers = response !== null && typeof response === "object" ? (response as Record<string, unknown>).answers : null;
+    if (answers === null || typeof answers !== "object" || Array.isArray(answers)) return [];
+    const toolInput = payload.tool_input ?? payload.toolInput;
+    const asked = toolInput !== null && typeof toolInput === "object" &&
+        Array.isArray((toolInput as Record<string, unknown>).questions)
+      ? (toolInput as { questions: unknown[] }).questions
+      : [];
+    const shown = (key: string): string => {
+      for (const entry of asked) {
+        const question = entry !== null && typeof entry === "object" ? entry as Record<string, unknown> : {};
+        if (question.id === key && typeof question.question === "string") return question.question;
+      }
+      return key;
+    };
+    const replies: Array<{ question: string; reply: string }> = [];
+    for (const [key, value] of Object.entries(answers)) {
+      const picks = value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>).answers
+        : value;
+      const reply = (Array.isArray(picks) ? picks : [picks])
+        .filter((pick): pick is string => typeof pick === "string" && pick.trim() !== "")
+        .join(", ");
+      if (reply !== "") replies.push({ question: shown(key), reply });
+    }
+    return replies;
+  } catch {
+    return [];
+  }
+}
+
 // Deliberately not exported. This hook mints human authority, so importing the
 // module from project code must not expose a callable function that accepts a
 // fabricated UserPromptSubmit payload. Harnesses and the dispatcher execute it
@@ -508,6 +550,20 @@ try {
           }
           if (sessionId && typedPrompt) {
             recordPlanApprovalOverrideRequest(projectDir, sessionId, typedPrompt);
+          }
+          // What the question box carried back goes on the record, question
+          // by question, so the person's reply stands even when no answer is
+          // logged for it. It decides nothing and spends no turn. Written
+          // after the turn's words, which are kept at the shard's size just
+          // after its row.
+          if (pickerQuestion !== undefined && !notAReply) {
+            for (const { question, reply } of pickerReplies(input)) {
+              appendAuditEntryUnlocked("QUESTION_REPLIED", {
+                ...(sessionId ? { Session: sessionId } : {}),
+                Question: question,
+                Reply: reply,
+              }, projectDir);
+            }
           }
         });
       } catch {

@@ -478,9 +478,12 @@ export function validateProjectionDescriptor(
       throw new Error(`${root}: ${safe} has an invalid integration policy`);
     }
     if (integration.policy === "json-entries") {
+      // In a project's own tree the root file is the team's, with AI-DLC's
+      // entries merged in; AI-DLC's part alone is the root-blocks copy.
+      const block = rootBlockPath(join(root, descriptor.harnessDir), integration);
       let shipped: unknown;
       try {
-        shipped = readJsonFile(path);
+        shipped = readJsonFile(existsSync(block) ? block : path);
       } catch {
         shipped = undefined;
       }
@@ -1420,7 +1423,8 @@ export function mergeJsonEntries(
 ): JsonEntriesResult {
   let shippedValue: unknown;
   try {
-    shippedValue = JSON.parse(withoutBom(shippedText));
+    // A project's own file read as the source may hold comments.
+    shippedValue = Bun.JSONC.parse(withoutBom(shippedText));
   } catch {
     return { conflict: "shipped JSON is malformed" };
   }

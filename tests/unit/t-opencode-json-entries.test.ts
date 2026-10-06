@@ -41,10 +41,10 @@ function temp(prefix: string): string {
   return path;
 }
 
-function run(args: string[], cwd: string): { status: number; stdout: string; stderr: string } {
+function run(args: string[], cwd: string, tool = INIT): { status: number; stdout: string; stderr: string } {
   // Keep the host's active runtime out of fixture source selection.
   const machine = temp("aidlc-t-ocje-machine-");
-  const result = spawnSync(BUN, [INIT, ...args], {
+  const result = spawnSync(BUN, [tool, ...args], {
     cwd,
     env: {
       ...process.env,
@@ -296,6 +296,46 @@ describe("a copy keeps the team's opencode.json", () => {
     // Once is enough.
     expect(addRootBlocks(dir)).not.toContain("opencode.json");
   });
+
+  // Copied, setup skipped, a first session, a settings change from the copy's
+  // own command, then a refresh from a release: the team's model, provider,
+  // instructions and rules are still theirs at the end, only AI-DLC's
+  // entries were ever recorded as AI-DLC's, and AGENTS.md and .gitignore keep
+  // one AI-DLC part each. Plain JSON and a file with comments alike.
+  const PLAIN_TEAM_FILE = `${JSON.stringify(parse(TEAM_FILE), null, 2)}\n`;
+  for (const [label, teamFile] of [["with comments", TEAM_FILE], ["plain JSON", PLAIN_TEAM_FILE]] as const) {
+    test(`after a first session and a settings change from the copy, a release refresh keeps the team's entries (${label})`, async () => {
+      const dir = project(teamFile);
+      // The copy runtime: the release tree without the files a copy leaves out.
+      cpSync(OPENCODE_RELEASE, dir, { recursive: true });
+      for (const path of copyChannelOmits(projectionFiles(OPENCODE_RELEASE).descriptor)) {
+        rmSync(join(dir, path), { force: true });
+      }
+      writeFileSync(join(dir, "opencode.json"), teamFile);
+      const { addRootBlocks } = await import("../../core/tools/aidlc-includes.ts");
+      expect(addRootBlocks(dir)).toContain("opencode.json");
+      const changed = run(
+        ["config", "models", "--project-dir", dir, "--project", "--reviewing-effort", "high", "--yes"],
+        dir,
+        join(dir, ".aidlc", "tools", "aidlc.ts"),
+      );
+      expect(changed.status, changed.stdout + changed.stderr).toBe(0);
+      for (const file of ["AGENTS.md", ".gitignore"]) {
+        expect(readFileSync(join(dir, file), "utf-8").match(/BEGIN AI-DLC/g), file).toHaveLength(1);
+      }
+      const recorded = Object.keys(contribution(dir)?.entries ?? {});
+      for (const team of ["model", "provider", "docs/team-rules.md", "git push *"]) {
+        expect(recorded.some((id) => id.includes(team)), `${team} recorded as AI-DLC's: ${recorded.join(", ")}`).toBe(false);
+      }
+      const value = parse(configured(dir));
+      expect(value.model).toBe("amazon-bedrock/team-model");
+      expect(value.provider).toEqual({ "amazon-bedrock": { options: { region: "eu-west-1" } } });
+      expect(value.instructions).toContain("docs/team-rules.md");
+      expect(value.instructions).toContain(".aidlc/onboarding.md");
+      expect(value.permission.bash["git push *"]).toBe("ask");
+      expect(value.permission.bash["*"]).toBe("allow");
+    });
+  }
 });
 
 describe("doctor reads the team's opencode.json by AI-DLC's entries", () => {

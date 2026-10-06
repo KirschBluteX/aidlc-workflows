@@ -220,7 +220,7 @@ on the revision process.
 After approval, a progress line appears:
 
 ```
-Progress: 4/33 overall | 1/7 IDEATION stages complete. Next: Market Research
+Progress: 1/30 in-scope stages complete (4/33 overall) | 1/7 IDEATION. Next: Market Research
 ```
 
 ### Remaining Ideation Stages

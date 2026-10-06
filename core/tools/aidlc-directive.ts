@@ -516,7 +516,7 @@ interface AskDirectiveBase {
   question: string;
 }
 
-/** One plan the person can name instead: its complete command, and its stage count as the person sees it ("17 of 33 stages"). */
+/** One plan the person can name instead: its complete command, and its stage count as the person sees it ("15 stages", the stages after Initialization). */
 export interface ScopeCommandRow {
   scope: string;
   command: string;

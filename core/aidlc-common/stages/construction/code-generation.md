@@ -257,9 +257,14 @@ do not begin Step 4 or dispatch the developer agent.
 After approval:
 
 - Under Guard Policy `strict`, an edit to the plan or test instructions asks the
-  person again: `next` shows the question. Under `relaxed` or `off`, the build
-  continues with the edited files and one `change_notices` line; the earlier
-  answer stays the record of what was approved.
+  person again: `next` shows the question, its `plan_approval.note` saying what
+  changed. Under `relaxed` or `off`, the build continues with the edited files
+  and one `change_notices` line saying what changed; the earlier answer stays
+  the record of what was approved.
+- When the person asks to go back to the plan they approved ("go back to the
+  approved plan"), run `{{INVOKE}} engine testing-posture restore --unit
+  <directive.unit>` (`--stage-level` for zero-Unit work), say the line it
+  prints, then run `next`.
 - Other code moving after approval (a `git pull`, another Unit landing) never
   asks again, on any Guard Policy: the build continues and a `change_notices`
   line names the files. Say it once.

@@ -54,6 +54,7 @@ import {
   readPlanApprovalLegacyWindow,
   readPlanApprovalLegacyRecoveryChallenge,
   readPlanApprovalOverrideRequest,
+  readApprovedPlanCopy,
   readPlanApprovalReceipt,
   readPlanApprovalResponse,
   readPlanApprovalViolation,
@@ -105,6 +106,7 @@ import {
   writePlanApprovalChallenge,
   writePlanApprovalLegacyRecoveryResponse,
   writePlanApprovalOverrideRequest,
+  writeApprovedPlanCopy,
   writePlanApprovalReceipt,
   runtimeSessionHint,
   writePlanApprovalResponse,
@@ -124,6 +126,7 @@ import {
   type PlanApprovalRuntimeResponse,
   type PlanApprovalRuntimeIdentity,
   type PlanApprovalRuntimeProvenance,
+  type ApprovedPlanCopy,
   type PlanApprovalRuntimeReceipt,
   type WorkspaceSourceState,
   type WorkspaceSourceListing,
@@ -1538,6 +1541,135 @@ export function workerBrief(
   };
 }
 
+// --- An approved plan that changed before the build ---------------------------------
+//
+// The files the person approved are kept beside the approval (writeApprovedPlanCopy).
+// When the plan or its test instructions on disk no longer match them and the
+// build has not started, the person hears one line naming what changed and how
+// to go back; `restore` writes the approved files back, so the approval matches
+// again. Ticks are not a change: the comparison is over the approval content.
+
+/** Keep the approved files for this target and attempt; only bytes that hash to the approval are kept. */
+export function keepApprovedPlanCopy(
+  projectDir: string,
+  authority: CodeGenerationAuthority,
+  fingerprint: string,
+  questions: string,
+): void {
+  // The copy only serves the change line and the way back: a copy that cannot
+  // be kept never stands between the person and their approval.
+  try {
+    const plan = readFileSync(join(authority.stageDir, "code-generation-plan.md"), "utf-8");
+    const instructions = readFileSync(join(authority.stageDir, "unit-test-instructions.md"), "utf-8");
+    const read = readTestingContract(plan);
+    if (!("contract" in read)) return;
+    if (approvalFingerprint(plan, instructions, read.contract.contract_sha256, authority) !== fingerprint) return;
+    writeApprovedPlanCopy(projectDir, authority, { version: 1, fingerprint, plan, instructions, questions });
+  } catch {
+    // Nothing to name later; the approval stands.
+  }
+}
+
+const APPROVED_PLAN_UNDO = 'Say "go back to the approved plan" to undo.';
+
+function quotedStep(text: string): string {
+  return `"${text.length > 80 ? `${text.slice(0, 77).trimEnd()}...` : text}"`;
+}
+
+/** What changed between the approved plan's steps and the plan's steps now, in the person's words. */
+function changedSteps(before: string[], after: string[]): string {
+  const at = Array.from({ length: Math.max(before.length, after.length) }, (_, index) => index)
+    .find((index) => before[index] !== after[index]);
+  if (at === undefined) return "the plan's text changed";
+  const same = (a: string[], b: string[]) => a.length === b.length && a.every((text, index) => text === b[index]);
+  if (after.length === before.length + 1 && same(after.slice(at + 1), before.slice(at))) {
+    return `step ${at + 1} ${quotedStep(after[at])} was added`;
+  }
+  if (before.length === after.length + 1 && same(before.slice(at + 1), after.slice(at))) {
+    return `step ${at + 1} ${quotedStep(before[at])} was removed`;
+  }
+  const what = at < after.length && at < before.length
+    ? `step ${at + 1} now says ${quotedStep(after[at])} instead of ${quotedStep(before[at])}`
+    : at < after.length
+      ? `step ${at + 1} ${quotedStep(after[at])} was added`
+      : `step ${at + 1} ${quotedStep(before[at])} was removed`;
+  const others = Array.from({ length: Math.max(before.length, after.length) }, (_, index) => index)
+    .filter((index) => index > at && before[index] !== after[index]).length;
+  return others > 0 ? `${what}, and ${others} more ${others === 1 ? "step" : "steps"} changed` : what;
+}
+
+export function approvedPlanChangeText(copy: ApprovedPlanCopy, plan: string, instructions: string): string | null {
+  const planChanged = projectPlanApprovalContent(plan) !== projectPlanApprovalContent(copy.plan);
+  const lf = (text: string) => text.replace(/\r\n/g, "\n");
+  const instructionsChanged = lf(instructions) !== lf(copy.instructions);
+  if (!planChanged && !instructionsChanged) return null;
+  if (!planChanged) return `Your approved test instructions changed before the build. ${APPROVED_PLAN_UNDO}`;
+  const what = changedSteps(planSteps(copy.plan).map((step) => step.text), planSteps(plan).map((step) => step.text));
+  return `Your approved plan changed before the build: ${what}${instructionsChanged ? ", and the test instructions changed too" : ""}. ` +
+    APPROVED_PLAN_UNDO;
+}
+
+/** The approved files for this target and attempt, when the person approved them and the build has not started. */
+function unbuiltApprovedCopy(
+  projectDir: string,
+  authority: CodeGenerationAuthority,
+): ApprovedPlanCopy | null {
+  const copy = readApprovedPlanCopy(projectDir, authority);
+  if (copy === null) return null;
+  const receipt = readPlanApprovalReceipt(projectDir, {
+    targetId: authority.targetId, runFloor: authority.runFloor, fingerprint: copy.fingerprint,
+  });
+  return receipt?.choice === "Approve Plan" && receipt.status === "approved" ? copy : null;
+}
+
+/**
+ * The one line the person hears when the plan they approved changed before the
+ * build, or null when it did not (or nothing was approved in this attempt).
+ */
+export function approvedPlanChangeLine(
+  projectDir: string,
+  target: CodeGenerationTarget,
+  issued?: CodeGenerationIssuance,
+): string | null {
+  try {
+    const authority = resolveCodeGenerationAuthority(projectDir, target, issued);
+    const copy = unbuiltApprovedCopy(projectDir, authority);
+    if (copy === null) return null;
+    return approvedPlanChangeText(
+      copy,
+      readFileSync(join(authority.stageDir, "code-generation-plan.md"), "utf-8"),
+      readFileSync(join(authority.stageDir, "unit-test-instructions.md"), "utf-8"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Write the approved plan, test instructions and answer back: the person said to go back to the plan they approved. */
+export function restoreApprovedPlan(projectDir: string, target: CodeGenerationTarget): string {
+  const authority = resolveCodeGenerationAuthority(projectDir, target);
+  const copy = readApprovedPlanCopy(projectDir, authority);
+  const receipt = copy === null ? null : readPlanApprovalReceipt(projectDir, {
+    targetId: authority.targetId, runFloor: authority.runFloor, fingerprint: copy.fingerprint,
+  });
+  if (copy === null || receipt?.choice !== "Approve Plan") {
+    throw new Error(
+      `There is no approved plan to go back to for ${authority.unit === null ? "this code" : authority.unit}. ` +
+        "Show the person the plan as it is now.",
+    );
+  }
+  withActiveDirectiveLock(projectDir, () => {
+    for (const [name, content] of [
+      ["code-generation-plan.md", copy.plan],
+      ["unit-test-instructions.md", copy.instructions],
+      ["code-generation-questions.md", copy.questions],
+    ] as const) {
+      writeRecordFileNoFollow(projectDir, relative(projectDir, join(authority.stageDir, name)), content);
+    }
+  });
+  return "Back to the plan you approved.";
+}
+
 // --- Picking up an interrupted build ----------------------------------------------
 //
 // The worker ticks the plan file as it finishes each step, but the brief hands
@@ -2624,6 +2756,8 @@ function recordCodeGenerationContinuation(
   operation: string,
 ): string[] {
   const detail = `${operation} for ${continuation.authority.targetId} using current content; the earlier approval is unchanged`;
+  // An approved plan that changed before the build is named for the person.
+  const changed = approvedPlanChangeLine(projectDir, { unit: continuation.authority.unit });
   const recorded = recordGuardStoodAside(projectDir, {
     fence: "plan-approval",
     authority: continuation.fence.authority,
@@ -2637,10 +2771,15 @@ function recordCodeGenerationContinuation(
   if (!recorded) {
     recordHookDrop(projectDir, "testing-posture", `GUARD_STOOD_ASIDE row not recorded (audit ledger busy or not writable): ${detail}`);
   }
-  // Under Guard Policy off the row is the whole account; nothing is said.
-  return guardStandAsideSpeaks(continuation.fence)
-    ? [guardStoodAsideLine("plan-approval", continuation.fence.source, detail, recorded)]
-    : [];
+  const line = guardStoodAsideLine("plan-approval", continuation.fence.source, detail, recorded);
+  // Under Guard Policy off the row is the whole account: the stand-aside line
+  // is not said.
+  const speaks = guardStandAsideSpeaks(continuation.fence);
+  if (changed === null) return speaks ? [line] : [];
+  // An approved plan that changed is named in place of the stand-aside line.
+  // A row the ledger could not take is still said beside it, so the doctor's
+  // list matches.
+  return recorded || !speaks ? [changed] : [changed, line];
 }
 
 export interface LegacyPlanApprovalGuardState {
@@ -3584,6 +3723,7 @@ function certifyPlanApprovalReceipt(
     status: "approved",
   };
   writePlanApprovalReceipt(projectDir, receipt);
+  keepApprovedPlanCopy(projectDir, evidence.authority, evidence.fingerprint, readFileSync(evidence.questionsPath, "utf-8"));
   keepWorkspaceSourceSnapshot(projectDir, stateBefore);
   clearPlanApprovalChallenge(projectDir, session);
   // A normal receipt spends any typed break-glass request too: the phrase
@@ -4802,7 +4942,7 @@ function flagValue(args: string[], name: string): string | undefined {
 
 function targetFromArgs(
   args: string[],
-  subcommand: "fingerprint" | "verify" | "begin" | "brief",
+  subcommand: "fingerprint" | "verify" | "begin" | "brief" | "restore",
 ): CodeGenerationTarget {
   const unitIndex = args.indexOf("--unit");
   const stageLevel = args.includes("--stage-level");
@@ -4996,9 +5136,12 @@ export function main(argv: string[]): void {
       case "reply":
         console.log(recordedPlanApprovalReply(projectDir, replySession(projectDir, argv)));
         return;
+      case "restore":
+        console.log(restoreApprovedPlan(projectDir, targetFromArgs(argv, "restore")));
+        return;
       default:
         throw new Error(
-          `Unknown subcommand: ${subcommand ?? "(none)"}. Valid: resolve, render, fingerprint, verify, begin, brief, reply`,
+          `Unknown subcommand: ${subcommand ?? "(none)"}. Valid: resolve, render, fingerprint, verify, begin, brief, reply, restore`,
         );
     }
   } catch (error) {

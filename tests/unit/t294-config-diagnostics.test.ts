@@ -2301,10 +2301,61 @@ describe("t294 post-apply outstanding actions", () => {
       "--yes",
     ], project, env);
     expect(applied.status, applied.stdout + applied.stderr).toBe(0);
-    expect(applied.stdout).toContain("codex-hook-trust-missing");
+    // Codex's hook trust is given inside Codex. The line names that step, the
+    // same one the hooks-off stop and doctor name, never AI-DLC's own review.
+    const recovery = (JSON.parse(readFileSync(
+      join(DIST_RELEASE, "codex", ".codex", "tools", "data", "harness.json"),
+      "utf-8",
+    )) as { hookActivation: { recovery: string } }).hookActivation.recovery;
+    const step = "in Codex, type /hooks, press t to trust all, then press Esc";
+    expect(recovery.startsWith(`I${step.slice(1)}.`), recovery).toBe(true);
     expect(applied.stdout).toContain(
-      "bun .codex/tools/aidlc.ts config trust",
+      `trust/codex-hook-trust-missing: Codex has not trusted this project's hooks yet - ${step}`,
     );
+    expect(applied.stdout).not.toContain("config trust");
+
+    const quiet = run([
+      "config",
+      "--project-dir",
+      project,
+      "--from",
+      join(DIST_RELEASE, "codex"),
+      "--quiet",
+      "--yes",
+    ], project, env);
+    expect(quiet.status, quiet.stdout + quiet.stderr).toBe(0);
+    expect(quiet.stdout).toContain(`Outstanding actions: ${step}`);
+    expect(quiet.stdout).not.toContain("config trust");
+
+    const json = run([
+      "config",
+      "--project-dir",
+      project,
+      "--from",
+      join(DIST_RELEASE, "codex"),
+      "--json",
+      "--yes",
+    ], project, env);
+    expect(json.status, json.stdout + json.stderr).toBe(0);
+    expect((JSON.parse(json.stdout) as {
+      data: { outstandingActions: Array<{ section: string; id: string; message: string; command: string; step?: string }> };
+    }).data.outstandingActions).toContainEqual({
+      section: "trust",
+      id: "codex-hook-trust-missing",
+      message: "Codex has not trusted this project's hooks yet",
+      command: "bun .codex/tools/aidlc.ts config trust --check",
+      step,
+    });
+
+    const check = run([
+      "config",
+      "trust",
+      "--project-dir",
+      project,
+      "--check",
+    ], project, env);
+    expect(check.status).not.toBe(0);
+    expect(check.stdout + check.stderr).toContain(`fix: ${step}`);
 
     const trustSection = run([
       "config",

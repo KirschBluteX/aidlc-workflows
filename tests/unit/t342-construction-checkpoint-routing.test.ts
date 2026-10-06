@@ -285,6 +285,18 @@ describe("t342 Construction checkpoint routing", () => {
     expect(following.construction_checkpoint).toBeUndefined();
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
+  // A live Claude Code run picked the work back up at a waiting Unit checkpoint:
+  // its step has no line of its own, so the pick-up line rides that step itself.
+  test("picking the work back up at a Unit checkpoint says where it picks up", () => {
+    const p = fixture();
+    cover(p, "alpha", stages);
+    const chat = { ...process.env, AIDLC_SESSION_OVERRIDE: "01995000-7a11-7000-8000-000000000342", AIDLC_SESSION_OVERRIDE_SOURCE: "payload" };
+    const resumed = runOrchestrateNext(join(AIDLC_SRC, "tools/aidlc-orchestrate.ts"), p, ["--resume"], { env: chat });
+    const directive = resumed.directive as { construction_checkpoint?: { unit: string }; narration?: string } | null;
+    expect(directive?.construction_checkpoint?.unit, resumed.stderr).toBe("alpha");
+    expect(String(directive?.narration)).toStartWith("Picking up where we left off, at ");
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
   // A live run built two Units one at a time with checkpoints and learnings
   // on: the checkpoint offered no learnings, and the agent's own try at each
   // stage was refused because Current Stage waits on the first one.

@@ -1109,7 +1109,7 @@ export const WORKSPACE_NOUNS = ["intent", "space"] as const;
 export type WorkspaceNoun = (typeof WORKSPACE_NOUNS)[number];
 
 // aidlc-testing-posture.ts runs the first of these it finds anywhere in argv.
-export const TESTING_POSTURE_SUBCOMMANDS = ["resolve", "render", "fingerprint", "verify", "begin", "brief", "reply"] as const;
+export const TESTING_POSTURE_SUBCOMMANDS = ["resolve", "render", "fingerprint", "verify", "begin", "brief", "reply", "restore"] as const;
 
 // The commands aidlc-utility.ts dispatches, as its unknown-command error lists them.
 export const UTILITY_COMMANDS = [
@@ -4802,6 +4802,44 @@ export function readPlanApprovalReceipt(
     "Plan Approval receipt",
   );
   return value?.version === 1 ? value : null;
+}
+
+/**
+ * The files a person approved for one Code Generation target and attempt: the
+ * plan, its test instructions, and the questions file that records the answer.
+ * Kept beside the receipt so a later change can be named in one line and undone
+ * by writing these bytes back. Each approval in the attempt replaces it.
+ */
+export interface ApprovedPlanCopy {
+  version: 1;
+  fingerprint: string;
+  plan: string;
+  instructions: string;
+  questions: string;
+}
+
+function approvedPlanCopyPath(projectDir: string, target: { targetId: string; runFloor: string }): string {
+  const key = createHash("sha256").update(`${target.targetId}\n${target.runFloor}`, "utf-8").digest("hex");
+  return join(planApprovalRuntimeDir(projectDir), `approved-${key}.json`);
+}
+
+export function writeApprovedPlanCopy(
+  projectDir: string,
+  target: { targetId: string; runFloor: string },
+  copy: ApprovedPlanCopy,
+): void {
+  ensurePlanApprovalRuntimeDir(projectDir);
+  writeFileAtomic(approvedPlanCopyPath(projectDir, target), `${JSON.stringify(copy)}\n`);
+}
+
+export function readApprovedPlanCopy(
+  projectDir: string,
+  target: { targetId: string; runFloor: string },
+): ApprovedPlanCopy | null {
+  const value = readPlanApprovalRuntimeJson<ApprovedPlanCopy>(approvedPlanCopyPath(projectDir, target), "approved plan copy");
+  return value?.version === 1 && typeof value.fingerprint === "string" && typeof value.plan === "string" &&
+      typeof value.instructions === "string" && typeof value.questions === "string"
+    ? value : null;
 }
 
 export function clearPlanApprovalReceipt(
@@ -36203,6 +36241,8 @@ export interface ScopeCostSummary {
   skip: number;          // total - execute
   gates: number;         // EXECUTE stages outside initialization; mirrors
                          // computeGate() in aidlc-orchestrate.ts - change together
+  shown: number;         // EXECUTE stages outside initialization: the stages a
+                         // run shows the person, the count every line they read uses
   perUnitStages: number; // EXECUTE stages that repeat per Unit of Work when
                          // units-generation EXECUTEs; otherwise they run once
   off: string[];        // scope defaults omitted from the gated-flow ceremony
@@ -36224,18 +36264,22 @@ export function gridCostSummary(
   const hasUnitDag = stages["units-generation"] === "EXECUTE";
   let execute = 0;
   let gates = 0;
+  let shown = 0;
   let perUnitStages = 0;
   for (const [slug, action] of Object.entries(stages)) {
     if (action !== "EXECUTE") continue;
     execute++;
     const node = byslug.get(slug);
     if (!node) continue;
-    if (node.phase !== "initialization") gates++;
+    if (node.phase !== "initialization") {
+      gates++;
+      shown++;
+    }
     // Without units-generation there is no Unit DAG, so per-unit stages
     // degrade to one stage-level pass (aidlc-orchestrate.ts).
     if (hasUnitDag && isPerUnitStage(node)) perUnitStages++;
   }
-  return { total, execute, skip: total - execute, gates, perUnitStages, off: [] };
+  return { total, execute, skip: total - execute, gates, shown, perUnitStages, off: [] };
 }
 
 /** Labels of ceremonies the effective policy turns off, plus reviewers when
@@ -36918,8 +36962,9 @@ function changeControlSourceFromLabel(label: string): string {
 
 /**
  * The label rendered after the value: `from scope classic`, `from project.md`,
- * `set by you` (the person's typed switch), `set by a command` (an explicit
- * setter with no typed turn behind it), `not set`.
+ * `set by you` (the person's typed switch, or a check they asked to turn off),
+ * `set by a command` (an explicit setter with no word of theirs behind it),
+ * `not set`.
  */
 export function changeControlSourceLabel(source: string): string {
   if (source === "not set") return source;

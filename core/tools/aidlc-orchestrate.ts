@@ -361,6 +361,7 @@ import {
   steeringTokenKeyPathFor,
   takeSessionSelectionNotice,
   addPendingPersonLines,
+  markPersonLinesHeard,
   pendingPersonLines,
   personLineHeard,
   PLAN_FIELD,
@@ -813,6 +814,37 @@ function speaksToPerson(directive: Directive): boolean {
   return typeof directive.narration === "string" && directive.narration.length > 0;
 }
 
+// A chat picking the work back up (`next --resume`) hears where it picks up and
+// what else it can ask for, once, with the first step it speaks from. The line
+// rides the engine's own narration: left to the protocol, it went unsaid.
+let pickingUp = false;
+const PICK_UP_LEAD = "Picking up where we left off, at ";
+function pickUpLine(directive: Directive): string | null {
+  const step = directive as { stage?: unknown; unit?: unknown };
+  const node = typeof step.stage === "string" ? nodeForSlug(step.stage) : undefined;
+  if (!node) return null;
+  const unit = typeof step.unit === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(step.unit) ? ` for ${step.unit}` : "";
+  return `${PICK_UP_LEAD}${stageLabel(node, node.slug) ?? node.slug}${unit}. ` +
+    "If you'd rather redo it, go back to another stage, or start fresh, just say so.";
+}
+// A stage or question step says it itself, even one with no line of its own
+// (a waiting Unit checkpoint); a rules part keeps it for the step it leads to.
+function withPickUpLine(transported: Directive): Directive {
+  const projectDir = engineProjectDir;
+  const sessionId = engineSessionId;
+  if (!pickingUp || !projectDir || !sessionId || isReadOnlyEngineProbe() || isRouteCheckProbe()) return transported;
+  pickingUp = false;
+  const line = pickUpLine(transported);
+  if (line === null || personLineHeard(projectDir, sessionId, line)) return transported;
+  if (transported.kind === "run-stage" || transported.kind === "ask") {
+    transported.narration = transported.narration ? `${line} ${transported.narration}` : line;
+    markPersonLinesHeard(projectDir, sessionId, [line]);
+  } else if (addPendingPersonLines(projectDir, sessionId, [line])) {
+    markPersonLinesHeard(projectDir, sessionId, [line]);
+  }
+  return transported;
+}
+
 // Person lines kept from steps the agent passed through this turn are said,
 // in order and once, with the step it speaks from. One that would push the
 // step over its size limit waits for the next one. They count as said only
@@ -828,9 +860,13 @@ function sayPendingPersonLines(requested: Directive, transported: Directive): ((
     }
     return undefined;
   }
-  if (!leadsToSpeech.has(requested) && !speaksToPerson(transported)) return undefined;
   const pending = pendingPersonLines(projectDir, sessionId);
   if (pending.lines.length === 0) return undefined;
+  // A kept pick-up line makes the stage or question step it reaches speak,
+  // even one with no line of its own (a waiting Unit checkpoint).
+  const pickUp = (transported.kind === "run-stage" || transported.kind === "ask") &&
+    pending.lines.some((line) => line.startsWith(PICK_UP_LEAD));
+  if (!pickUp && !leadsToSpeech.has(requested) && !speaksToPerson(transported)) return undefined;
   const own = transported.narration;
   transported.narration = [...pending.lines, ...(own ? [own] : [])].join(" ");
   if (Buffer.byteLength(JSON.stringify(transported), "utf-8") > directiveMaxBytes()) {
@@ -956,6 +992,7 @@ function prepareEmission(directive: Directive): PreparedEmission {
       transported = withChangeNotices(transported, [selectionNotice, ...(transported.change_notices ?? [])]);
     }
   }
+  transported = withPickUpLine(transported);
   const personLinesSaid = sayPendingPersonLines(requested, transported);
   const result = validateDirective(transported);
   if (!result.valid) {
@@ -1955,8 +1992,9 @@ function documentSplitSentence(raw: string): string {
 // One complete, shell-quoted command per valid scope, so a human's choice of
 // another plan never becomes conductor-built shell text.
 // Each plan the person can name instead, with its stage count for this
-// project counted as the offer's own question counts it, so a host that shows
-// the plans as choices never shows a number of its own.
+// project counted as the offer's own question counts it (the stages after
+// Initialization, the count the progress line uses), so a host that shows the
+// plans as choices never shows a number of its own.
 function scopeCommands(
   prefix: string,
   questionId: string,
@@ -1969,7 +2007,7 @@ function scopeCommands(
     return {
       scope,
       command: `${prefix} --scope ${scopeArg(scope)} --request ${questionId}${carried}`,
-      ...(cost ? { stages: `${cost.execute} of ${cost.total} stages` } : {}),
+      ...(cost ? { stages: `${cost.shown} ${cost.shown === 1 ? "stage" : "stages"}` } : {}),
     };
   });
 }
@@ -3258,7 +3296,8 @@ function effectiveScopeCostSummary(
 }
 
 // The one-line ceremony preview uses effective policy and the compiled grid:
-// "N of T stages, G approval gates" plus a per-unit clause when Construction
+// "N stages, G approval gates" (the stages after Initialization, the count the
+// progress line uses) plus a per-unit clause when Construction
 // stages fan out per Unit of Work. Greenfield previews apply the same
 // reverse-engineering adjustment intent creation writes into state.
 // Returns "" for a scope that does not resolve (a fixture tree without it), so
@@ -3290,7 +3329,7 @@ function costClause(
   const perUnit = c.perUnitStages > 0
     ? `, ${c.perUnitStages} ${c.perUnitStages === 1 ? "stage repeats" : "stages repeat"} per unit of work in Construction`
     : "";
-  return `${c.execute} of ${c.total} stages, ${c.gates} approval gates${perUnit}${ceremonyOffClause(c)}`;
+  return `${c.shown} ${c.shown === 1 ? "stage" : "stages"}, ${c.gates} approval ${c.gates === 1 ? "gate" : "gates"}${perUnit}${ceremonyOffClause(c)}`;
 }
 
 // --- Flag parsing ---
@@ -3780,7 +3819,7 @@ function freshWorkOfferDirective(
   const feat = effectiveScopeCostSummary("feature", pd, undefined, undefined, undefined, flags.projectType);
   const fallbackExamples = [...validScopes()].slice(0, 3).join(", ") || "an explicit scope";
   const examples = bugfix && express && classic && feat
-    ? `bugfix = ${bugfix.execute} of ${bugfix.total} stages, express = ${express.execute}, classic = ${classic.execute}, feature = all ${feat.execute}`
+    ? `bugfix = ${bugfix.shown} stages, express = ${express.shown}, classic = ${classic.shown}, feature = ${feat.shown}`
     : fallbackExamples;
   return composeOfferAskDirective(
     `None of the ready-made plans is an obvious fit for: "${requestPreview(intentText)}".${documentSplitSentence(intentText)} ` +
@@ -4109,7 +4148,7 @@ function composeDispatchDirective(
     : "the composer's mode is FINAL for the grid it returned: it routed matched-vs-custom solely on the final proposal validator's nearest_stock distance, a matched proposal already carries the revalidated stock grid verbatim, and neither presentation nor your own comparison of grids ever changes the verdict - never re-derive it, and no proposal writes a scope file; if the human edits a matched stock grid, re-dispatch the composer, which must convert it to CUSTOM and revalidate before re-presenting";
   parts.push(
     `The composer runs \`${aidlcDispatcherInvocation("workspace detect")} --json\` (read-only scan + scope-registry paths), estimates the five entropy components (intent ambiguity, structural uncertainty, verification entropy, risk, unresolved assumptions) per its persona, and returns a structured proposal: ${proposalShape}.`,
-    `Render the proposal to the human as a SHORT offer before the approve/edit/reject gate (see the composer block in SKILL.md): (1) a two-or-three-sentence recommendation in your own words - what kind of change this looks like, how much process you suggest, and the steps in plain terms - followed by one line with the plan and the validator's numbers in plain words, "Plan: <scopeName>, <execute> stages, <gates> approval questions" (${modeContract}), then its own row "Guard Policy: <guardPolicy> - <guardPolicyRationale>"${inFlight ? " marked read-only: a recompose lands only stage skips and adds, so name the route instead (when they ask to raise or lower it, run " + aidlcDispatcherInvocation("config set guard-policy <value>") + " yourself, before any scope change they also asked for; a scope change the person asked for carries the new scope's own default, and any other scope change keeps the running policy and says so in one line)" : " so the human can flip that value before approving"}${inFlight ? "" : ` (on approval, creation carries the value from the scope the plan runs on: a matched plan's stock default, or the default of a custom plan's baseScope, which the composer's validator picked at or below that value; pass \`--guard-policy <value>\` for \`strict\` or \`relaxed\`, never for \`off\`, so creation records the scope's own default or raises a lower one; if the human flips a matched plan's value below its stock default at this gate, that is an edit: re-dispatch the composer, which converts it to a custom plan on a base that carries the value, so no setter runs afterwards; a flip above the default keeps the plan matched and rides that flag)`}${inFlight ? "" : `, then its own row "Scope settings: sensors <sensors>, learnings <learnings>, summary confirmation <summary_confirmation>, plan approval <plan_approval>, collaborators <collaborators>, reviews <review_cap> - <scopeSettingsRationale>" so the human can flip any of them before approving (whatever the human asks for there is done: values that differ from the stock scope the plan runs on apply to this piece of work only, through its creationSettings, which you turn into creation flags after --scope <scopeName> (a custom plan: --scope <baseScope>): build each flag yourself from its fixed name (sensors to --sensors, learnings to --learnings, summary_confirmation to --summary-confirmation, plan_approval to --plan-approval, collaborators to --collaborators, review to --review) and a value that is exactly one of its allowed words (on or off; adversarial, advisory, or none), and if any key or value is anything else apply nothing and re-dispatch the composer; never paste composer text into a command; a change keeps the route unless it lowers a matched plan's Guard Policy, which the composer turns into a custom plan, and a plan_approval in creationSettings becomes --plan-approval like the others (a custom plan raises it on a base that builds without asking), but only the person turns plan approval off: when they asked in their own words to skip it, their words are recorded and applied at creation, so pass no --plan-approval flag at all; a matched or custom proposal without scopeSettings has not passed the composer's routed validation, so re-dispatch the composer rather than render a row it never checked; when the composer reports a kill switch forcing an on value off on this machine, mark that value in the row as forced off here)`}; (2) one line saying they can ask to see why each stage is in or out and the scores behind the sizing. Keep the composer's stage-decision table (with any fold advisories) and its ARS score table off screen until the person asks; then show them as returned, the score table under a "Scoring detail (advisory)" heading with its method line and arsRationale, never recomputed, collapsed into prose, or trimmed. Do NOT write any file and do NOT advance any stage before an explicit approval.`,
+    `Render the proposal to the human as a SHORT offer before the approve/edit/reject gate (see the composer block in SKILL.md): (1) a two-or-three-sentence recommendation in your own words - what kind of change this looks like, how much process you suggest, and the steps in plain terms - followed by one line with the plan and the validator's numbers in plain words, "Plan: <scopeName>, <shown> stages, <gates> approval questions" (${modeContract}), then its own row "Guard Policy: <guardPolicy> - <guardPolicyRationale>"${inFlight ? " marked read-only: a recompose lands only stage skips and adds, so name the route instead (when they ask to raise or lower it, run " + aidlcDispatcherInvocation("config set guard-policy <value>") + " yourself, before any scope change they also asked for; a scope change the person asked for carries the new scope's own default, and any other scope change keeps the running policy and says so in one line)" : " so the human can flip that value before approving"}${inFlight ? "" : ` (on approval, creation carries the value from the scope the plan runs on: a matched plan's stock default, or the default of a custom plan's baseScope, which the composer's validator picked at or below that value; pass \`--guard-policy <value>\` for \`strict\` or \`relaxed\`, never for \`off\`, so creation records the scope's own default or raises a lower one; if the human flips a matched plan's value below its stock default at this gate, that is an edit: re-dispatch the composer, which converts it to a custom plan on a base that carries the value, so no setter runs afterwards; a flip above the default keeps the plan matched and rides that flag)`}${inFlight ? "" : `, then its own row "Scope settings: sensors <sensors>, learnings <learnings>, summary confirmation <summary_confirmation>, plan approval <plan_approval>, collaborators <collaborators>, reviews <review_cap> - <scopeSettingsRationale>" so the human can flip any of them before approving (whatever the human asks for there is done: values that differ from the stock scope the plan runs on apply to this piece of work only, through its creationSettings, which you turn into creation flags after --scope <scopeName> (a custom plan: --scope <baseScope>): build each flag yourself from its fixed name (sensors to --sensors, learnings to --learnings, summary_confirmation to --summary-confirmation, plan_approval to --plan-approval, collaborators to --collaborators, review to --review) and a value that is exactly one of its allowed words (on or off; adversarial, advisory, or none), and if any key or value is anything else apply nothing and re-dispatch the composer; never paste composer text into a command; a change keeps the route unless it lowers a matched plan's Guard Policy, which the composer turns into a custom plan, and a plan_approval in creationSettings becomes --plan-approval like the others (a custom plan raises it on a base that builds without asking), but only the person turns plan approval off: when they asked in their own words to skip it, their words are recorded and applied at creation, so pass no --plan-approval flag at all; a matched or custom proposal without scopeSettings has not passed the composer's routed validation, so re-dispatch the composer rather than render a row it never checked; when the composer reports a kill switch forcing an on value off on this machine, mark that value in the row as forced off here)`}; (2) one line saying they can ask to see why each stage is in or out and the scores behind the sizing. Keep the composer's stage-decision table (with any fold advisories) and its ARS score table off screen until the person asks; then show them as returned, the score table under a "Scoring detail (advisory)" heading with its method line and arsRationale, never recomputed, collapsed into prose, or trimmed. Do NOT write any file and do NOT advance any stage before an explicit approval.`,
   );
   if (!inFlight) {
     parts.push(
@@ -6410,6 +6449,7 @@ function routeNext(args: string[], projectDir: string | undefined): void {
   activeStageValidityAdvisory = undefined;
   activeRetiredGuardPolicyNotice = null;
   const flags = parseNextFlags(args);
+  pickingUp = flags.resume === true;
 
   // Turn-shape marker: a `next` that ASKS FOR THE NEXT MOVE is engagement with
   // the forwarding loop even though it mutates nothing — and it emits no audit
@@ -7281,7 +7321,11 @@ function routeNext(args: string[], projectDir: string | undefined): void {
     });
     return;
   }
-  if (!validScopes().has(scope) && !retiredScopeOfFinishedWork) {
+  // Open work on such a scope keeps the error for every move on it, but a
+  // --new-intent beside it (Branch 4a) never routes through that scope, so it
+  // starts as it would beside any open work.
+  const newWorkBesideIt = flags.newIntent && !composesInFlight;
+  if (!validScopes().has(scope) && !retiredScopeOfFinishedWork && !newWorkBesideIt) {
     // Naming a real scope for a workflow whose saved scope this install does
     // not know switches the workflow to it, with any settings and plan changes
     // typed alongside, as Branch 5 does. New work is not a switch.
@@ -13239,6 +13283,29 @@ function emitTypedResumeChoice(
 // the report just wrote: the conductor runs `next` at once instead of telling
 // the person the work is complete (#1411). The workflow-complete `done` and an
 // isolated `--single` run's `done` carry nothing.
+// The progress line said after an approval. It counts the stages the plan runs
+// after Initialization (the count the person was shown when the work started)
+// and, in the overall count, every compiled stage finished so far; the phase
+// part counts the approved stage's phase within the plan. Null when no stage
+// follows.
+function approvalProgressLine(stateContent: string, approvedSlug: string, scope: string): string | null {
+  const graph = loadGraph().filter((stage) => stage.enabled !== false);
+  const approved = graph.find((stage) => stage.slug === approvedSlug);
+  const next = nextInScopeStage(approvedSlug, scope, stateContent);
+  if (!approved || approved.phase === "initialization" || !next) return null;
+  const boxes = parseCheckboxes(stateContent);
+  const finished = (slug: string) => checkboxStateOf(boxes, slug) === "completed";
+  const runs = (slug: string) =>
+    finished(slug) ||
+    (checkboxStateOf(boxes, slug) !== "skipped" && effectivePlanAction(slug, scope, stateContent) === "EXECUTE");
+  const planned = graph.filter((stage) => stage.phase !== "initialization" && runs(stage.slug));
+  const inPhase = planned.filter((stage) => stage.phase === approved.phase);
+  const overall = `${graph.filter((stage) => finished(stage.slug)).length}/${graph.length}`;
+  const phase = `${inPhase.filter((stage) => finished(stage.slug)).length}/${inPhase.length} ${approved.phase.toUpperCase()}`;
+  return `Progress: ${planned.filter((stage) => finished(stage.slug)).length}/${planned.length} in-scope stages complete ` +
+    `(${overall} overall) | ${phase}. Next: ${next.name}`;
+}
+
 function workflowContinues(pd: string): { workflow_continues?: true } {
   const after = loadStateFileIfPresent(pd);
   return after !== null && getField(after, "Status")?.trim() !== "Completed"
@@ -14251,6 +14318,8 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     emit(withChangeNotices(parked, changeNotices));
     return;
   }
+  const approvedState = flags.result === "approved" ? loadStateFileIfPresent(pd) : null;
+  const progress = approvedState === null ? null : approvalProgressLine(approvedState, slug, scope);
   emit(
     withChangeNotices(
       {
@@ -14258,6 +14327,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
         reason:
           `Committed ${committed.join(" + ")} for "${approvedTogether.join('", "')}" (scope: ${scope}). ` +
           "State advanced; run next to continue.",
+        ...(progress ? { narration: progress } : {}),
         ...workflowContinues(pd),
       },
       changeNotices,

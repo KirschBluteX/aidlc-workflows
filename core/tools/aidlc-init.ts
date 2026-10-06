@@ -207,6 +207,8 @@ import {
   providerAnswerIsTheSession,
   sessionModelAccessFact,
   availableScopeNames,
+  CODEX_HOOK_TRUST_UNMET,
+  codexHookTrustStep,
   completionInstruction,
   copilotCliTrust,
   detectAwsCredentials,
@@ -1802,6 +1804,9 @@ function checkDiagnosticSection(
   }
   const blockers = issues.filter((issue) => issue.severity !== "warn");
   const warnings = issues.filter((issue) => issue.severity === "warn");
+  // Only the person can give Codex its hook trust, inside Codex.
+  const hostSteps = [...new Set(blockers.map((issue) => codexHookTrustStep(issue.id)))];
+  const hostStep = hostSteps.length === 1 ? hostSteps[0] : null;
   const providersUnrecorded = section === "providers" && records.providers === null;
   const cleanMessage = section === "providers" && harnessOwnsModelAccess(selected.harness)
     ? `providers needs no answer for ${selected.harness}; its model access is harness-managed`
@@ -1831,7 +1836,7 @@ function checkDiagnosticSection(
             blockers.map((issue) => `${issue.id} (${issue.message})`).join("; ")
           }`,
           EXIT.failure,
-          configCommand(`${section} --show`),
+          hostStep ?? configCommand(`${section} --show`),
         ),
     options,
   );
@@ -2135,8 +2140,17 @@ function diagnosticWizard(
     }
     return next;
   }
+  // Codex's own hook trust comes first, so the review question below never
+  // reads as that step.
+  const codexStep = selected.harness === "codex"
+    ? trustStatus(projectDir, selected.harnessDir, selected.harness).issues
+      .map((issue) => codexHookTrustStep(issue.id)).find((step) => step !== null)
+    : undefined;
+  if (codexStep) writeMenuRow("  ", `${CODEX_HOOK_TRUST_UNMET}: ${codexStep}.`);
   const answer = promptYesDefault(
-    "  Record that you reviewed the trust and allowlist files?",
+    codexStep
+      ? "  Separately, record that you reviewed AI-DLC's trust and allowlist files?"
+      : "  Record that you reviewed the trust and allowlist files?",
     false,
   );
   process.stdout.write(
@@ -2228,14 +2242,14 @@ function configCompletionMessage(
 ): string {
   if (actions.length === 0 || mode === "json") return base;
   if (mode === "quiet") {
-    const commands = [...new Set(actions.map((action) => action.command))];
+    const commands = [...new Set(actions.map((action) => action.step ?? action.command))];
     return `${base}\nOutstanding actions: ${commands.join("; ")}`;
   }
   return [
     base,
     "Outstanding actions:",
     ...actions.map((action) =>
-      `  ${action.section}/${action.id}: ${action.message} - run \`${action.command}\``
+      `  ${action.section}/${action.id}: ${action.message} - ${action.step ?? `run \`${action.command}\``}`
     ),
   ].join("\n");
 }
@@ -2431,7 +2445,7 @@ function setupMapRows(
   // Copilot in VS Code gates hooks on switches AI-DLC cannot read, so the row
   // names them as the person's to check instead of reporting all trust as met.
   const copilot = modelHarness(distribution) === "copilot";
-  const trustDetail = trust.length === 1 && trust[0].id === "copilot-folder-untrusted"
+  const trustDetail = trust.length === 1 && (trust[0].id === "copilot-folder-untrusted" || trust[0].step)
     ? trust[0].message
     : trust.length > 0
     ? `${trust.length} host trust issue${trust.length === 1 ? "" : "s"}`
@@ -2543,7 +2557,8 @@ function renderSetupLedger(
     } still need${actions.length === 1 ? "s" : ""} you\n`,
   );
   for (const action of actions) {
-    writeCommandRow(`    ${action.section.padEnd(12)} `, action.command);
+    if (action.step) writeMenuRow(`    ${action.section.padEnd(12)} `, action.step);
+    else writeCommandRow(`    ${action.section.padEnd(12)} `, action.command);
   }
 }
 
@@ -6970,7 +6985,8 @@ function renderFirstRunEnding(
         continue;
       }
       writeMenuRow("    ", action.message);
-      writeCommandRow("    fix: ", action.command);
+      if (action.step) writeMenuRow("    fix: ", action.step);
+      else writeCommandRow("    fix: ", action.command);
       process.stdout.write("\n");
     }
   }
@@ -7966,6 +7982,9 @@ function planRootIntegrations(
   // MCP is on because the project already has the shipped servers: keep and
   // update those, and add none it does not have.
   keepPresent = false,
+  // The source is the project's own copied tree, whose json-entries file is
+  // the team's own with AI-DLC's part merged in.
+  ownJsonEntries = ownBytes,
 ): void {
   let siblings: ProjectHarness[] | undefined;
   let siblingProjections: Array<{
@@ -8347,7 +8366,12 @@ function planRootIntegrations(
           ? { kind: "whole" }
           : { kind: "matching" };
       } else {
-        ownership = legacyMatch || sameJsonText(current, shippedText) ? { kind: "whole" } : { kind: "none" };
+        // From the project's own files the "shipped" file is the team's file
+        // itself, so matching it proves nothing: only entries naming AI-DLC's
+        // own folders are read as AI-DLC's, as at the first session.
+        ownership = legacyMatch || (!ownJsonEntries && sameJsonText(current, shippedText))
+          ? { kind: "whole" }
+          : { kind: "none" };
       }
       const merged = mergeJsonEntries(current, shippedText, ownership, force);
       if ("conflict" in merged) {
@@ -10876,6 +10900,7 @@ export async function main(
           rootContributions,
           ownFilesProject,
           keepPresentServers,
+          true,
         );
       }
     }

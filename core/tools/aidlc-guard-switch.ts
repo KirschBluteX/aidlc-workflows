@@ -454,6 +454,10 @@ export function applyIntentSettings(
     personSpokeSinceGate(projectDir, { requests: true, outlivesApproval: true });
   const saidAsAsked = (key: string): boolean =>
     askedInChat && key !== "plan-approval" && lowering.some((item) => item.key === key);
+  // A check the person asked in the chat to turn off is theirs, whoever runs the
+  // setter: turning one off needs their turn, so it is on record behind it.
+  const personAsked = (key: string): boolean =>
+    typedByPerson || (askedInChat && lowering.some((item) => item.key === key));
 
   const audit: AuditEntryInput[] = [];
   const lines: string[] = [];
@@ -615,12 +619,12 @@ export function applyIntentSettings(
   for (const key of CEREMONY_KEYS) {
     const value = ceremonies[key];
     if (value === undefined) continue;
-    // Only the person's typed switch is `you`; an explicit setter run from a
-    // shell records that a command set it, and never relabels the person's
-    // own identical choice.
+    // The person's own setting is `you`; an explicit setter run from a shell,
+    // with no word of theirs behind it, records that a command set it, and
+    // never relabels the person's own identical choice.
     const flag = CEREMONY_FLAGS[key].slice(2) as ConfigKey;
     const requestedSource = requested[flag]!.source;
-    const source = requestedSource === "you" && !typedByPerson ? "command" : requestedSource;
+    const source = requestedSource === "you" && !personAsked(flag) ? "command" : requestedSource;
     const field = CEREMONY_FIELDS[key];
     const previous = getField(content, field);
     const line = formatCeremony(value, source);
@@ -637,7 +641,7 @@ export function applyIntentSettings(
       eventType: "CEREMONY_SET",
       fields: {
         Key: key, Old: oldValue, New: value, Source: source,
-        ...(askedIn && source === "command" && value === "off" ? { "Person Reply": askedIn } : {}),
+        ...(askedIn && value === "off" ? { "Person Reply": askedIn } : {}),
       },
     });
     const oldDisplay = resolution.intent === null && resolution.rawStateValue !== null
