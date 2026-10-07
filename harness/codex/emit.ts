@@ -136,8 +136,7 @@ sandbox_mode = "workspace-write"
 # then warns at every start and points at ~/.codex/config.toml, so this turns
 # that warning off. It also hides the warning for any other under-development
 # feature while you work in this project. For numbered prose gates in one
-# session, start Codex with -c features.default_mode_request_user_input=false
-# (editing [features] here reads as a local change on the next aidlc config).
+# session, start Codex with -c features.default_mode_request_user_input=false.
 suppress_unstable_features_warning = true
 
 # The AIDLC method (the markdown rule layers: org/team/project + phases/) now
@@ -467,7 +466,7 @@ export default function emit(ctx: EmitContext): void {
   }
 
   // (a) authored orchestrator shell with the standard token projection.
-  for (const f of ["SKILL.md", "question-rendering.md"]) {
+  for (const f of ["SKILL.md", "question-rendering.md", "composer.md"]) {
     emissions.push({
       path: join(SKILLS_DST, "aidlc", f),
       content: () =>

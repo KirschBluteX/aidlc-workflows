@@ -172,7 +172,7 @@ The aidlc-product-agent asks you to choose an interaction mode:
 - **Edit File** opens the artifact for direct editing
 - **Chat** lets you discuss freely; the agent extracts decisions
 
-See [Interaction Modes](07-interaction-modes.md) for details on each mode. You can switch modes mid-stage.
+See [Interaction Modes](07-interaction-modes.md) for details on each mode. You can switch modes mid-stage. You choose once: later stages reuse your choice and say so in one line, and you change it by saying so.
 
 ### Approval Gate
 
@@ -190,9 +190,13 @@ After the agent completes its work, you see a completion summary and an approval
 **Review outcome:** One concern remains for your decision.
 **Why now:** First review completed.
 
-| ID | Severity | Location | Finding | Required action | Status |
-|---|---|---|---|---|---|
-| R-01 | Minor | aidlc/spaces/default/intents/260820-checkout/ideation/intent-capture/intent-statement.md > Success Criteria | The adoption target has no deadline | Add the date by which the adoption target should be reached | New |
+| ID | Severity | Where | Status |
+|---|---|---|---|
+| R-01 | Minor | intent-statement.md > Success Criteria | New |
+
+> R-01 Finding: The adoption target has no deadline
+
+> R-01 Required action: Add the date by which the adoption target should be reached
 
 **Decision options:**
 - **Approve** - continue with the open findings accepted.

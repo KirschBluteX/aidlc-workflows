@@ -178,12 +178,14 @@ import {
   activeModelGroups,
   applyModelPolicyToProjection,
   HARNESS_HONESTY,
+  HARNESS_PRODUCT_NAMES,
   harnessHonestyNotes,
   isModelEffort,
   isModelPreset,
   MODEL_EFFORTS,
   MODEL_GROUPS,
   MODEL_PRESETS,
+  modelPolicyAgentsDir,
   modelPolicyIsEmpty,
   modelPolicySurfaceDrift,
   normalizeModelPolicy,
@@ -307,6 +309,8 @@ type PreparedRefreshSource = {
   regenerated: Set<string>;
   retiredManagedFiles: Set<string>;
   projectOverlays?: ReadonlySet<string>;
+  // Files whose merge could not be proven: a refresh replaces them only with --force.
+  unproven?: ReadonlySet<string>;
   entries?: Baseline["entries"];
   notes: string[];
 };
@@ -2298,23 +2302,31 @@ function sameFile(left: string, right: string): boolean {
   }
 }
 
+// The harness this config run sets up or refreshes, once it is known. No
+// projection names one in the source tree, so the commands this run prints
+// name this harness's tool there, not the first install the project shows.
+let configTargetHarnessDir: string | null = null;
+
 // How a printed command starts so it runs from where the user is: `aidlc`, or
 // the Bun tool that ran this command. The project's own tool is named from the
 // project when run there and by its path in the project when not. Any other
 // tool (a runtime unpacked elsewhere, which may be adding a harness the project
 // does not have yet) is named by its own path, unless it is the one under the
-// working directory. In the source tree the project's own tool stands in.
+// working directory. In the source tree the project's own tool of the harness
+// being set up stands in.
 function configInvocationFor(projectDir = process.cwd()): string {
   const invocation = aidlcInvocation();
   if (invocation === "aidlc") return invocation;
   const ran = projectedDispatcher();
   // A projection's relative invocation names the harness directory it was
   // built for, whatever the environment says the harness is.
-  const harnessDir = ran === null ? runtimeHarnessDir() : basename(dirname(dirname(ran)));
+  const harnessDir = ran === null
+    ? configTargetHarnessDir ?? runtimeHarnessDir()
+    : basename(dirname(dirname(ran)));
   const toolIn = (root: string) => join(root, harnessDir, "tools", "aidlc.ts");
   if (ran === null || sameFile(ran, toolIn(projectDir))) {
     return ranFromProject(projectDir)
-      ? invocation
+      ? ran === null ? `bun ${harnessDir}/tools/aidlc.ts` : invocation
       : `bun ${quoteCommandArgument(toolIn(projectDir))}`;
   }
   return sameFile(ran, toolIn(process.cwd())) ? invocation : `bun ${quoteCommandArgument(ran)}`;
@@ -4753,9 +4765,12 @@ function preserveClaudeProviderFields(
     }
     staged.statusLine = current.statusLine;
   }
+  // A value equal to this release's own is AI-DLC's, not the person's: a
+  // copied runtime brings it in before the first setup records anything.
   if (
     Object.hasOwn(current, "companyAnnouncements") &&
-    sha256Bytes(canonical(current.companyAnnouncements)) !== priorEntries?.companyAnnouncements
+    sha256Bytes(canonical(current.companyAnnouncements)) !== priorEntries?.companyAnnouncements &&
+    canonical(current.companyAnnouncements) !== canonical(staged.companyAnnouncements)
   ) {
     if (shippedChanged("companyAnnouncements")) {
       notes.push(
@@ -4857,6 +4872,13 @@ const CODEX_FRAMEWORK_ASSIGNMENTS = [
     pattern:
       /[\t ]*(?:suppress_unstable_features_warning|"suppress_unstable_features_warning"|'suppress_unstable_features_warning')[\t ]*=[^\r\n]*(?:\r?\n|$)/y,
   },
+  // The raised output budget: without it Codex cuts a long workflow instruction
+  // short for a model outside its catalog.
+  {
+    name: "tool_output_token_limit",
+    pattern:
+      /[\t ]*(?:tool_output_token_limit|"tool_output_token_limit"|'tool_output_token_limit')[\t ]*=[^\r\n]*(?:\r?\n|$)/y,
+  },
 ] as const;
 
 // Match only real root assignments, not lookalikes in onboarding prose, arrays,
@@ -4935,13 +4957,657 @@ function codexSections(
   return sections;
 }
 
+// A TOML table header or assignment with its exact source range and full key
+// path. Comments and blank lines belong to no statement, so an edit never moves
+// them. `table` is the header an assignment sits under ([] at the root);
+// `comment` says the statement's own lines carry a comment, `innerComment` that
+// one sits inside its value (a multi-line array).
+type TomlStatement = {
+  kind: "header" | "assignment";
+  path: string[];
+  table: string[];
+  // A header or assignment inside an array of tables: never AI-DLC's.
+  arrayTable: boolean;
+  start: number;
+  end: number;
+  valueStart: number;
+  valueEnd: number;
+  comment: boolean;
+  innerComment: boolean;
+};
+
+// The key path a TOML key or header spells (quoted, escaped and dotted forms
+// alike), read by parsing it.
+function tomlParsedPath(text: string): string[] | null {
+  try {
+    let value: unknown = Bun.TOML.parse(text);
+    const path: string[] = [];
+    while (isRecord(value) && Object.keys(value).length === 1) {
+      const key = Object.keys(value)[0];
+      path.push(key);
+      value = value[key];
+    }
+    return path.length > 0 ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+// The index of a key's `=` from `from`, outside quotes and before `limit` or the
+// line end; -1 when there is none.
+function tomlKeyEquals(content: string, from: number, limit = content.length): number {
+  for (let index = from; index < limit; index++) {
+    const char = content[index];
+    if (char === "\n") return -1;
+    if (char === "=") return index;
+    if (char === '"' || char === "'") {
+      index++;
+      while (index < limit && content[index] !== char && content[index] !== "\n") {
+        if (char === '"' && content[index] === "\\") index++;
+        index++;
+      }
+    }
+  }
+  return -1;
+}
+
+// The span of one TOML value starting after `=` at `from`. A statement value
+// ends at the line end outside strings and brackets; a member of an inline table
+// ends before its `,` or `}`. `end` is past the statement's line end.
+function tomlValueSpan(
+  content: string,
+  from: number,
+  member: boolean,
+  limit = content.length,
+): { valueStart: number; valueEnd: number; end: number; comment: boolean; inner: boolean } | null {
+  let index = from;
+  while (index < limit && (content[index] === " " || content[index] === "\t")) index++;
+  const valueStart = index;
+  let valueEnd = index;
+  let depth = 0;
+  let comment = false;
+  let inner = false;
+  while (index < limit) {
+    const char = content[index];
+    if (depth === 0 && member && (char === "," || char === "}")) {
+      return { valueStart, valueEnd, end: index, comment, inner };
+    }
+    if (char === "\n") {
+      if (depth === 0 && !member) return { valueStart, valueEnd, end: index + 1, comment, inner };
+      index++;
+      continue;
+    }
+    if (char === " " || char === "\t" || char === "\r") {
+      index++;
+      continue;
+    }
+    if (char === "#") {
+      comment = true;
+      if (depth > 0) inner = true;
+      while (index < limit && content[index] !== "\n") index++;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const delimiter = content.startsWith(char.repeat(3), index) ? char.repeat(3) : char;
+      index += delimiter.length;
+      for (;;) {
+        if (index >= limit) return null;
+        if (char === '"' && content[index] === "\\") {
+          index += 2;
+          continue;
+        }
+        if (content.startsWith(delimiter, index)) {
+          // Up to two quotes may close the content right before the delimiter.
+          for (let extra = 0; extra < 2 && delimiter.length === 3 && content[index + 3] === char; extra++) {
+            index++;
+          }
+          break;
+        }
+        if (delimiter.length === 1 && content[index] === "\n") return null;
+        index++;
+      }
+      index += delimiter.length;
+      valueEnd = index;
+      continue;
+    }
+    if (char === "[" || char === "{") depth++;
+    else if (char === "]" || char === "}") depth--;
+    if (depth < 0) return null;
+    index++;
+    valueEnd = index;
+  }
+  return depth === 0 && !member ? { valueStart, valueEnd, end: limit, comment, inner } : null;
+}
+
+// Every table header and assignment of a TOML file, in order; null when a line
+// cannot be read, so the caller never edits what it did not understand.
+function tomlStatements(content: string): TomlStatement[] | null {
+  const statements: TomlStatement[] = [];
+  let table: string[] = [];
+  let arrayTable = false;
+  let index = 0;
+  while (index < content.length) {
+    const lineStart = index;
+    while (index < content.length && (content[index] === " " || content[index] === "\t")) index++;
+    const char = content[index];
+    if (index >= content.length) break;
+    if (char === "\n" || char === "\r" || char === "#") {
+      const newline = content.indexOf("\n", index);
+      index = newline < 0 ? content.length : newline + 1;
+      continue;
+    }
+    if (char === "[") {
+      const newline = content.indexOf("\n", index);
+      const end = newline < 0 ? content.length : newline + 1;
+      const line = content.slice(lineStart, end);
+      const path = tomlParsedPath(`${line.trimEnd()}\n`);
+      if (path === null) return null;
+      table = path;
+      arrayTable = content.startsWith("[[", index);
+      statements.push({
+        kind: "header", path, table: [], arrayTable,
+        start: lineStart, end, valueStart: end, valueEnd: end,
+        // A header name holds no `#` outside quotes, so one here opens a comment.
+        comment: /#/.test(line.replace(/"(?:[^"\\\n]|\\.)*"|'[^'\n]*'/g, "")),
+        innerComment: false,
+      });
+      index = end;
+      continue;
+    }
+    const equals = tomlKeyEquals(content, index);
+    if (equals < 0) return null;
+    const key = tomlParsedPath(`${content.slice(index, equals)}= 0\n`);
+    const value = tomlValueSpan(content, equals + 1, false);
+    if (key === null || value === null) return null;
+    statements.push({
+      kind: "assignment", path: [...table, ...key], table, arrayTable,
+      start: lineStart, end: value.end, valueStart: value.valueStart, valueEnd: value.valueEnd,
+      comment: value.comment,
+      innerComment: value.inner,
+    });
+    index = value.end;
+  }
+  return statements;
+}
+
+// The value span of `path` inside the inline table spanning valueStart..valueEnd.
+function tomlInlineMemberSpan(
+  content: string,
+  valueStart: number,
+  valueEnd: number,
+  path: readonly string[],
+): { start: number; end: number; innerComment: boolean } | null {
+  if (content[valueStart] !== "{" || content[valueEnd - 1] !== "}") return null;
+  const close = valueEnd - 1;
+  let index = valueStart + 1;
+  while (index < close) {
+    while (index < close && /[\s,]/.test(content[index])) index++;
+    if (index >= close) break;
+    const equals = tomlKeyEquals(content, index, close);
+    if (equals < 0) return null;
+    const key = tomlParsedPath(`${content.slice(index, equals)}= 0\n`);
+    const value = tomlValueSpan(content, equals + 1, true, close + 1);
+    if (key === null || value === null) return null;
+    if (pathStartsWith(path, key)) {
+      return key.length === path.length
+        ? { start: value.valueStart, end: value.valueEnd, innerComment: value.inner }
+        : tomlInlineMemberSpan(content, value.valueStart, value.valueEnd, path.slice(key.length));
+    }
+    index = value.end;
+  }
+  return null;
+}
+
+// The span of the value that defines `path`: its own assignment, wherever the
+// file puts it, or its member inside an enclosing inline table.
+function tomlValueSpanOf(
+  content: string,
+  statements: readonly TomlStatement[],
+  path: readonly string[],
+): { start: number; end: number; innerComment: boolean; statement: TomlStatement } | null {
+  for (const statement of statements) {
+    if (statement.kind !== "assignment" || statement.arrayTable) continue;
+    if (!pathStartsWith(path, statement.path)) continue;
+    if (statement.path.length === path.length) {
+      return {
+        start: statement.valueStart,
+        end: statement.valueEnd,
+        innerComment: statement.innerComment,
+        statement,
+      };
+    }
+    const member = tomlInlineMemberSpan(
+      content,
+      statement.valueStart,
+      statement.valueEnd,
+      path.slice(statement.path.length),
+    );
+    return member ? { ...member, statement } : null;
+  }
+  return null;
+}
+
+function pathStartsWith(path: readonly string[], prefix: readonly string[]): boolean {
+  return prefix.length <= path.length && prefix.every((part, at) => part === path[at]);
+}
+
+// A key path as TOML spells it: bare parts where allowed, quoted otherwise.
+function tomlKey(path: readonly string[]): string {
+  return path.map((part) => /^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part)).join(".");
+}
+
+function tomlPathValue(
+  root: unknown,
+  path: readonly string[],
+): { found: boolean; value: unknown; clash: boolean } {
+  let value: unknown = root;
+  for (const part of path) {
+    if (value === undefined) return { found: false, value: undefined, clash: false };
+    if (!isTomlTable(value)) return { found: false, value: undefined, clash: true };
+    value = Object.hasOwn(value, part) ? value[part] : undefined;
+  }
+  return { found: value !== undefined, value, clash: false };
+}
+
+// A TOML table as parsed: a plain object. Dates and times parse to other objects.
+function isTomlTable(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+// Values compare as TOML values (the parser already reads a CRLF line end inside
+// a multi-line string as one line end). Paths in `skip` are left out, and tables
+// they leave empty with them.
+function codexValueText(value: unknown, skip: ReadonlySet<string> = new Set(), path: string[] = []): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => codexValueText(item)).join(",")}]`;
+  if (isTomlTable(value)) {
+    const members = Object.keys(value).sort().flatMap((key) => {
+      const child = [...path, key];
+      if (skip.has(JSON.stringify(child))) return [];
+      const text = codexValueText(value[key], skip, child);
+      return skip.size > 0 && text === "{}" && isTomlTable(value[key]) ? [] : [`${JSON.stringify(key)}:${text}`];
+    });
+    return `{${members.join(",")}}`;
+  }
+  if (value !== null && typeof value === "object") return JSON.stringify(`${value.constructor?.name}:${String(value)}`);
+  return JSON.stringify(value);
+}
+
+const CODEX_VALUE_ENTRY_PREFIX = "value:";
+const CODEX_SPACE_POINTER = JSON.stringify(["shell_environment_policy", "set", "AIDLC_RULES_DIR"]);
+const CODEX_SPACE_MEMORY = /^aidlc\/spaces\/[^/"\\]+\/memory$/;
+
+function codexValueEntry(path: readonly string[]): string {
+  return `${CODEX_VALUE_ENTRY_PREFIX}${JSON.stringify(path)}`;
+}
+
+// AI-DLC's own settings in config.toml: each leaf key under the shipped root
+// assignments and framework tables, by full path. A project table under one of
+// those roots (an [agents.<name>] role) is never one of them.
+function codexFrameworkLeaves(shipped: Record<string, unknown>): string[][] {
+  const leaves: string[][] = [];
+  const walk = (value: unknown, path: string[]): void => {
+    if (isTomlTable(value) && Object.keys(value).length > 0) {
+      for (const [key, child] of Object.entries(value)) walk(child, [...path, key]);
+    } else {
+      leaves.push(path);
+    }
+  };
+  for (const { name } of CODEX_FRAMEWORK_ASSIGNMENTS) {
+    if (Object.hasOwn(shipped, name)) leaves.push([name]);
+  }
+  for (const name of CODEX_FRAMEWORK_TABLES) {
+    if (isTomlTable(shipped[name])) walk(shipped[name], [name]);
+  }
+  return leaves;
+}
+
+function codexFrameworkValueEntries(config: string): Array<[string, string]> {
+  const shipped = Bun.TOML.parse(config) as Record<string, unknown>;
+  return codexFrameworkLeaves(shipped).map((path) => [
+    codexValueEntry(path),
+    sha256Bytes(codexValueText(tomlPathValue(shipped, path).value)),
+  ]);
+}
+
+// The hashes a baseline from before per-value records holds, read from real
+// statements: per root assignment, and per top-level table section from its
+// header to the next real header (a table a later release retires included).
+function legacyCodexEntryHashes(
+  content: string,
+  statements: readonly TomlStatement[],
+): Record<string, string> {
+  const hashes: Record<string, string> = {};
+  for (const statement of statements) {
+    if (statement.kind !== "assignment" || statement.table.length !== 0 || statement.path.length !== 1) continue;
+    if (Object.hasOwn(hashes, statement.path[0])) continue;
+    const key = statement.start + (/^[\t ]*/.exec(content.slice(statement.start, statement.end))?.[0].length ?? 0);
+    hashes[statement.path[0]] = sha256Bytes(content.slice(key, statement.end).replaceAll("\r\n", "\n").trimEnd());
+  }
+  const headers = statements.filter((statement) => statement.kind === "header");
+  for (const [at, header] of headers.entries()) {
+    const name = header.path.length === 1 && !header.arrayTable ? header.path[0] : null;
+    if (name === null || Object.hasOwn(hashes, name)) continue;
+    const text = content.slice(header.start, headers[at + 1]?.start ?? content.length)
+      .replaceAll("\r\n", "\n")
+      .trimEnd();
+    hashes[name] = sha256Bytes(text);
+  }
+  return hashes;
+}
+
+function plainList(items: readonly string[]): string {
+  return items.length <= 1
+    ? items.join("")
+    : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+// Refresh AI-DLC's own settings in the project's config.toml and keep every byte
+// of the project's: its keys (also inside AI-DLC's tables), its tables, comments,
+// blank lines, order and spelling. A value of AI-DLC's nobody changed takes the
+// release's; a value the project changed stays theirs; a deleted one comes back;
+// a retired one goes while it still holds what AI-DLC wrote. Returns null when
+// the file cannot be merged and proven, so the caller falls back.
+function mergeCodexEntries(
+  staged: string,
+  currentFile: string,
+  priorEntries: Record<string, string> | undefined,
+  pristine: boolean,
+  label: string,
+): { content: string; notes: string[] } | null {
+  // Anything the merge fails to read or prove (a crafted file included) leaves
+  // the file to the whole-table fallback.
+  try {
+    return planCodexEntries(staged, currentFile, priorEntries, pristine, label);
+  } catch {
+    return null;
+  }
+}
+
+function planCodexEntries(
+  staged: string,
+  currentFile: string,
+  priorEntries: Record<string, string> | undefined,
+  pristine: boolean,
+  label: string,
+): { content: string; notes: string[] } | null {
+  const bom = currentFile.startsWith("\uFEFF") ? "\uFEFF" : "";
+  const current = currentFile.slice(bom.length);
+  const newline = current.includes("\r\n") ? "\r\n" : "\n";
+  const lines = (text: string): string => text.replaceAll("\r\n", "\n").replaceAll("\n", newline);
+  const stagedObject = Bun.TOML.parse(staged) as Record<string, unknown>;
+  const currentObject = Bun.TOML.parse(current) as Record<string, unknown>;
+  const stagedStatements = tomlStatements(staged);
+  const currentStatements = tomlStatements(current);
+  if (stagedStatements === null || currentStatements === null) return null;
+
+  const recorded = priorEntries ?? {};
+  // No record at all: a baseline from before entries, where an untouched file is
+  // all AI-DLC's, or a file AI-DLC never wrote.
+  const unrecorded = Object.keys(recorded).length === 0;
+  const perValue = Object.keys(recorded).some((key) => key.startsWith(CODEX_VALUE_ENTRY_PREFIX));
+  const legacyCurrent = perValue ? {} : legacyCodexEntryHashes(current, currentStatements);
+  const legacyStaged = perValue ? {} : legacyCodexEntryHashes(staged, stagedStatements);
+  const leaves = codexFrameworkLeaves(stagedObject);
+  const expected = new Map<string, unknown>();
+  const sets: string[][] = [];
+  const putBack: string[] = [];
+  const kept: string[] = [];
+  for (const leaf of leaves) {
+    const target = tomlPathValue(stagedObject, leaf).value;
+    const now = tomlPathValue(currentObject, leaf);
+    if (now.clash || (now.found && isTomlTable(now.value) !== isTomlTable(target))) return null;
+    const key = JSON.stringify(leaf);
+    const legacyKey = leaf[0];
+    const record = perValue ? recorded[codexValueEntry(leaf)] : recorded[legacyKey];
+    const same = now.found && codexValueText(now.value) === codexValueText(target);
+    const spacePointer = now.found && key === CODEX_SPACE_POINTER &&
+      typeof now.value === "string" && CODEX_SPACE_MEMORY.test(now.value) &&
+      typeof target === "string" && CODEX_SPACE_MEMORY.test(target);
+    if (same || spacePointer) {
+      expected.set(key, now.value);
+      continue;
+    }
+    if (!now.found) {
+      if (!pristine && record !== undefined && (perValue || legacyCurrent[legacyKey] === undefined)) {
+        putBack.push(tomlKey(leaf));
+      }
+      sets.push(leaf);
+      expected.set(key, target);
+      continue;
+    }
+    // The record says what AI-DLC last wrote. A key it never recorded is the
+    // project's, unless no record exists at all and the file is untouched.
+    const unedited = unrecorded
+      ? pristine
+      : record !== undefined &&
+        (perValue ? record === sha256Bytes(codexValueText(now.value)) : legacyCurrent[legacyKey] === record);
+    if (unedited) {
+      sets.push(leaf);
+      expected.set(key, target);
+      continue;
+    }
+    // The project's own value stays; say so only when this release ships another.
+    const shippedChanged = record === undefined ||
+      (perValue ? record !== sha256Bytes(codexValueText(target)) : legacyStaged[legacyKey] !== record);
+    if (shippedChanged) kept.push(tomlKey(leaf));
+    expected.set(key, now.value);
+  }
+
+  // Retired: recorded, no longer shipped, and still holding what AI-DLC wrote.
+  const shippedLeaves = new Set(leaves.map((leaf) => JSON.stringify(leaf)));
+  const retired: string[][] = [];
+  if (perValue) {
+    for (const [entry, hash] of Object.entries(recorded)) {
+      if (!entry.startsWith(CODEX_VALUE_ENTRY_PREFIX)) continue;
+      const path = JSON.parse(entry.slice(CODEX_VALUE_ENTRY_PREFIX.length)) as string[];
+      if (shippedLeaves.has(JSON.stringify(path))) continue;
+      const now = tomlPathValue(currentObject, path);
+      if (now.found && sha256Bytes(codexValueText(now.value)) === hash) retired.push(path);
+    }
+  } else {
+    // An older baseline: a section exactly as recorded (or, with no record at
+    // all, an untouched file) is AI-DLC's, so what this release no longer ships
+    // in it goes.
+    const ownedSection = (name: string): boolean => unrecorded
+      ? pristine && (CODEX_FRAMEWORK_TABLES.has(name) ||
+        CODEX_FRAMEWORK_ASSIGNMENTS.some((assignment) => assignment.name === name))
+      : recorded[name] !== undefined && legacyCurrent[name] === recorded[name];
+    for (const statement of currentStatements) {
+      if (statement.kind !== "assignment" || statement.arrayTable) continue;
+      const inSection = statement.table.length === 0 ? statement.path.length === 1 : statement.table.length === 1;
+      if (!inSection || !ownedSection(statement.path[0])) continue;
+      if (tomlPathValue(stagedObject, statement.path).found) continue;
+      if (leaves.some((leaf) => pathStartsWith(leaf, statement.path))) continue;
+      retired.push(statement.path);
+    }
+  }
+
+  const edits: Array<{ start: number; end: number; text: string; order: number }> = [];
+  const insertedStatements = new Set<number>();
+  const appendedTables = new Set<string>();
+  const appended: string[] = [];
+  for (const leaf of sets) {
+    const value = tomlValueSpanOf(staged, stagedStatements, leaf);
+    if (value === null) return null;
+    const valueText = lines(staged.slice(value.start, value.end));
+    const existing = tomlValueSpanOf(current, currentStatements, leaf);
+    if (existing !== null) {
+      // A comment of the project's inside the old value would go with it.
+      if (existing.innerComment) return null;
+      edits.push({ start: existing.start, end: existing.end, text: valueText, order: edits.length });
+      continue;
+    }
+    // Missing inside an inline table of the project's: add it as one more member.
+    const inline = currentStatements.find((statement) =>
+      statement.kind === "assignment" && !statement.arrayTable &&
+      statement.path.length < leaf.length && pathStartsWith(leaf, statement.path)
+    );
+    if (inline) {
+      if (inline.path.length !== leaf.length - 1 || current[inline.valueStart] !== "{") return null;
+      const inner = current.slice(inline.valueStart + 1, inline.valueEnd - 1);
+      const at = inline.valueStart + 1 + inner.trimEnd().length;
+      const member = `${tomlKey(leaf.slice(inline.path.length))} = ${valueText}`;
+      const lead = inner.trim() === "" || inner.trimEnd().endsWith(",") ? " " : ", ";
+      edits.push({ start: at, end: at, text: `${lead}${member}`, order: edits.length });
+      continue;
+    }
+    // Missing: add the shipped statement that defines it, once.
+    const shippedStatement = value.statement;
+    if (insertedStatements.has(shippedStatement.start)) continue;
+    insertedStatements.add(shippedStatement.start);
+    const statementPath = shippedStatement.path;
+    if (currentStatements.some((statement) => pathStartsWith(statement.path, statementPath))) return null;
+    const statementValue = lines(staged.slice(shippedStatement.valueStart, shippedStatement.valueEnd));
+    if (statementPath.length === 1) {
+      const text = lines(staged.slice(shippedStatement.start, shippedStatement.end).trimEnd());
+      edits.push({ start: 0, end: 0, text: `${text}${newline}${newline}`, order: edits.length });
+      continue;
+    }
+    const tableName = statementPath[0];
+    const header = currentStatements.find((statement) =>
+      statement.kind === "header" && !statement.arrayTable &&
+      statement.path.length === 1 && statement.path[0] === tableName
+    );
+    if (header) {
+      const section = currentStatements.slice(currentStatements.indexOf(header) + 1);
+      const next = section.findIndex((statement) => statement.kind === "header");
+      const body = next < 0 ? section : section.slice(0, next);
+      const at = body.length > 0 ? body[body.length - 1].end : header.end;
+      const lead = at === current.length && !current.endsWith("\n") ? newline : "";
+      edits.push({
+        start: at,
+        end: at,
+        text: `${lead}${tomlKey(statementPath.slice(1))} = ${statementValue}${newline}`,
+        order: edits.length,
+      });
+      continue;
+    }
+    const rootDefined = currentStatements.filter((statement) =>
+      statement.kind === "assignment" && statement.table.length === 0 &&
+      statement.path[0] === tableName
+    );
+    if (rootDefined.length > 0) {
+      const at = rootDefined[rootDefined.length - 1].end;
+      edits.push({
+        start: at,
+        end: at,
+        text: `${tomlKey(statementPath)} = ${statementValue}${newline}`,
+        order: edits.length,
+      });
+      continue;
+    }
+    if (appendedTables.has(tableName)) continue;
+    appendedTables.add(tableName);
+    // Append the shipped table, with the comment lines right above its header.
+    const shippedHeader = stagedStatements.find((statement) =>
+      statement.kind === "header" && statement.path.length === 1 && statement.path[0] === tableName
+    );
+    if (!shippedHeader) return null;
+    const shippedSection = stagedStatements.slice(stagedStatements.indexOf(shippedHeader) + 1);
+    const shippedNext = shippedSection.findIndex((statement) => statement.kind === "header");
+    const shippedBody = shippedNext < 0 ? shippedSection : shippedSection.slice(0, shippedNext);
+    let from = shippedHeader.start;
+    while (from > 0) {
+      const previousStart = staged.lastIndexOf("\n", from - 2) + 1;
+      if (!staged.slice(previousStart, from).trimStart().startsWith("#")) break;
+      from = previousStart;
+    }
+    const to = shippedBody.length > 0 ? shippedBody[shippedBody.length - 1].end : shippedHeader.end;
+    // One blank line before each appended table.
+    const separator = appendedTables.size > 1
+      ? newline
+      : current.length === 0 || current.endsWith(`${newline}${newline}`)
+      ? ""
+      : current.endsWith("\n")
+      ? newline
+      : `${newline}${newline}`;
+    appended.push(`${separator}${lines(staged.slice(from, to).trimEnd())}${newline}`);
+  }
+  // Appended tables come after anything added to the file's own last table.
+  for (const text of appended) {
+    edits.push({ start: current.length, end: current.length, text, order: edits.length });
+  }
+  // A retired setting goes with its line; a comment of the project's on that
+  // line, or a setting inside an inline table, is not AI-DLC's to remove.
+  const removed = new Set<TomlStatement>();
+  for (const path of retired) {
+    const existing = tomlValueSpanOf(current, currentStatements, path);
+    if (existing === null) continue;
+    if (existing.statement.path.length !== path.length || existing.statement.comment) return null;
+    removed.add(existing.statement);
+    edits.push({ start: existing.statement.start, end: existing.statement.end, text: "", order: edits.length });
+  }
+  // A retired table's header goes with its last setting.
+  for (const [at, header] of currentStatements.entries()) {
+    if (header.kind !== "header" || header.arrayTable || header.path.length !== 1) continue;
+    if (isTomlTable(stagedObject[header.path[0]])) continue;
+    const section = currentStatements.slice(at + 1);
+    const next = section.findIndex((statement) => statement.kind === "header");
+    const body = next < 0 ? section : section.slice(0, next);
+    if (body.length === 0 || !body.every((statement) => removed.has(statement))) continue;
+    if (header.comment) return null;
+    edits.push({ start: header.start, end: header.end, text: "", order: edits.length });
+  }
+
+  // Apply from the end; edits at one offset keep the shipped order.
+  edits.sort((left, right) => right.start - left.start || right.order - left.order);
+  let merged = current;
+  let limit = current.length;
+  for (const edit of edits) {
+    if (edit.end > limit) return null;
+    merged = merged.slice(0, edit.start) + edit.text + merged.slice(edit.end);
+    limit = edit.start;
+  }
+
+  // Prove the result before it is used: it parses, AI-DLC's settings hold what
+  // was planned, and everything else equals the project's file.
+  const mergedObject = Bun.TOML.parse(merged) as Record<string, unknown>;
+  for (const leaf of leaves) {
+    const got = tomlPathValue(mergedObject, leaf);
+    if (!got.found || codexValueText(got.value) !== codexValueText(expected.get(JSON.stringify(leaf)))) {
+      return null;
+    }
+  }
+  for (const path of retired) if (tomlPathValue(mergedObject, path).found) return null;
+  const owned = new Set([...leaves, ...retired].map((path) => JSON.stringify(path)));
+  if (codexValueText(mergedObject, owned) !== codexValueText(currentObject, owned)) return null;
+
+  const notes: string[] = [];
+  if (unrecorded && !pristine && sets.length > 0 && current.trim() !== "") {
+    notes.push(`added AI-DLC's settings to ${label}; your own settings were kept.`);
+  } else if (putBack.length > 0) {
+    notes.push(`put back AI-DLC's ${plainList(putBack)} in ${label}.`);
+  }
+  if (kept.length === 1) {
+    notes.push(
+      `kept your ${kept[0]} in ${label}; this release ships a different value. Delete the key and refresh to take it.`,
+    );
+  } else if (kept.length > 1) {
+    notes.push(
+      `kept your ${plainList(kept)} in ${label}; this release ships different values. Delete a key and refresh to take its shipped value.`,
+    );
+  }
+  return { content: `${bom}${merged}`, notes };
+}
+
 function mergeCodexUserConfiguration(
   staged: string,
   current: string,
   priorEntries: Record<string, string> | undefined,
   pristine: boolean,
-): { content: string; frameworkOwnedClean: boolean } {
-  // Keep project model/provider assignments and custom tables, but always
+  notes: string[],
+  label: string,
+): { content: string; frameworkOwnedClean: boolean; proven: boolean } {
+  const entries = mergeCodexEntries(staged, current, priorEntries, pristine, label);
+  if (entries !== null) {
+    notes.push(...entries.notes);
+    return { content: entries.content, frameworkOwnedClean: true, proven: true };
+  }
+  // A file the per-entry merge cannot prove keeps the whole-table behaviour:
+  // keep project model/provider assignments and custom tables, but always
   // stage framework tables from the release. Local drift in those tables
   // remains visible to the ownership planner.
   let merged = current;
@@ -4997,6 +5663,7 @@ function mergeCodexUserConfiguration(
   return {
     content: merged.endsWith("\n") ? merged : `${merged}\n`,
     frameworkOwnedClean,
+    proven: false,
   };
 }
 
@@ -5005,6 +5672,8 @@ function preserveCodexProviderFields(
   stagedRoot: string,
   harnessDir: string,
   prior: Baseline | null,
+  notes: string[],
+  unproven: Set<string>,
 ): boolean {
   const relative = `${harnessDir}/config.toml`;
   const currentPath = join(projectDir, relative);
@@ -5016,9 +5685,14 @@ function preserveCodexProviderFields(
     current,
     prior?.entries?.[relative],
     sha256Bytes(current) === prior?.files[relative],
+    notes,
+    relative,
   );
   writeFileSync(stagedPath, merged.content);
-  return merged.frameworkOwnedClean;
+  // A file this refresh wrote can hold the project's own keys inside AI-DLC's
+  // tables, which the whole-table merge would drop: only --force replaces it.
+  if (!merged.proven && merged.content !== current) unproven.add(relative);
+  return merged.proven;
 }
 
 // True when the staged release merges opencode.json per entry: the team's
@@ -5080,6 +5754,7 @@ function preserveUserProviderFields(
   prior: Baseline | null,
   notes: string[],
   retiredManagedFiles: Set<string>,
+  unproven: Set<string>,
 ): boolean {
   if (harness === "claude") {
     // Claude settings merge per entry, so the refreshed file always applies.
@@ -5095,7 +5770,7 @@ function preserveUserProviderFields(
     )) retiredManagedFiles.add(rel);
     return true;
   } else if (harness === "codex") {
-    return preserveCodexProviderFields(projectDir, stagedRoot, harnessDir, prior);
+    return preserveCodexProviderFields(projectDir, stagedRoot, harnessDir, prior, notes, unproven);
   } else if (harness === "opencode") {
     preserveOpenCodeProviderFields(projectDir, stagedRoot);
   }
@@ -5162,13 +5837,15 @@ function prepareRefreshSource(
   } else if (!projectProjection && entries && descriptor.distribution === "codex") {
     const rel = `${descriptor.harnessDir}/config.toml`;
     const config = readFileSync(join(sourceRoot, rel), "utf-8");
-    entries[rel] = Object.fromEntries([
-      ...codexFrameworkAssignments(config)
-        .map((assignment) => [assignment.name, sha256Bytes(assignment.text)]),
-      ...codexSections(config)
-        .filter((section) => CODEX_FRAMEWORK_TABLES.has(section.name))
-        .map((section) => [section.name, sha256Bytes(section.text)]),
-    ]);
+    // Per-value records drive the refresh; the table and assignment records stay
+    // beside them for the whole-table fallback and for older releases.
+    const legacy = legacyCodexEntryHashes(config, tomlStatements(config) ?? []);
+    entries[rel] = {
+      ...Object.fromEntries(Object.entries(legacy).filter(([name]) =>
+        CODEX_FRAMEWORK_TABLES.has(name) || CODEX_FRAMEWORK_ASSIGNMENTS.some((assignment) => assignment.name === name)
+      )),
+      ...Object.fromEntries(codexFrameworkValueEntries(config)),
+    };
   }
   const currentHarness = join(projectDir, descriptor.harnessDir);
   const currentHarnessData = join(currentHarness, "tools", "data", "harness.json");
@@ -5338,9 +6015,9 @@ function prepareRefreshSource(
     }
   }
   // Preserve project-owned provider/model fields and unrelated additions.
-  // Claude's AI-DLC entries are refreshed in place; Codex's framework-owned
-  // entries remain tied to the baseline.
+  // Claude's and Codex's AI-DLC entries are refreshed in place, per entry.
   const retiredManagedFiles = new Set<string>();
+  const unproven = new Set<string>();
   const configurationOwnershipClean = preserveUserProviderFields(
     projectDir,
     root,
@@ -5352,6 +6029,7 @@ function prepareRefreshSource(
     prior,
     notes,
     retiredManagedFiles,
+    unproven,
   );
   // A recorded flag overrides a directly customized settings value.
   applyProjectFlagsToProjection(
@@ -5610,7 +6288,7 @@ function prepareRefreshSource(
       }
     }
   }
-  return { root, cleanup, regenerated, retiredManagedFiles, projectOverlays, entries, notes };
+  return { root, cleanup, regenerated, retiredManagedFiles, projectOverlays, unproven, entries, notes };
   } catch (error) {
     rmSync(cleanup, { recursive: true, force: true });
     throw error;
@@ -7462,7 +8140,15 @@ function customizeFirstRun(
 
 async function runFirstRunWizard(projectDir: string): Promise<boolean> {
   try {
-  const candidates = installedSourceCandidates();
+  // A pinned project is set up from its pinned release, as `config --harness`
+  // is: the children below pass the chosen root as --from, and a source other
+  // than the pin would be refused only after every question was answered. A
+  // malformed pin, or a pinned release this machine lacks, leaves the wizard
+  // to the regular path, which reports it before asking anything.
+  const pinPath = join(projectDir, ".aidlc-version");
+  const pinned = regularFile(pinPath) ? readFileSync(pinPath, "utf-8").trim() : undefined;
+  if (pathPresent(pinPath) && (pinned === undefined || !VERSION_ID.test(pinned))) return false;
+  const candidates = installedSourceCandidates(pinned);
   if (candidates.length === 0) return false;
   // Storage that cannot hold the transaction lock would fail at apply, after
   // every question; find out before asking any. Whatever the check hits (a
@@ -7720,6 +8406,7 @@ function planManagedFiles(
   regenerated: ReadonlySet<string>,
   retainBaseline: boolean,
   projectOverlays: ReadonlySet<string> = new Set(),
+  unproven: ReadonlySet<string> = new Set(),
 ): void {
   const shipped = new Set<string>();
   for (const directory of descriptor.managedDirectories) {
@@ -7810,6 +8497,7 @@ function planManagedFiles(
         targetExists &&
         (
           !targetRegular ||
+          unproven.has(rel) ||
           (!adoptedManagedFile && (!priorHash || currentHash !== priorHash))
         ) &&
         !force
@@ -9611,7 +10299,12 @@ const RIGHT_AWAY_FLAGS = new Map([
   ["flags.questionRetentionDays", "question retention"],
 ]);
 
-function openWorkflowLine(projectDir: string, mutations: readonly SettingsMutation[]): string | null {
+// `nextSession` names a tool that reads the change only when a session starts.
+function openWorkflowLine(
+  projectDir: string,
+  mutations: readonly SettingsMutation[],
+  nextSession?: string,
+): string | null {
   const open = activeWorkflowDescriptions(projectDir);
   const [first, ...rest] = mutations;
   if (open.length === 0 || !first) return null;
@@ -9641,16 +10334,19 @@ function openWorkflowLine(projectDir: string, mutations: readonly SettingsMutati
     ...changed.flatMap((id) => RIGHT_AWAY_FLAGS.get(id) ?? []),
   ];
   const nextStep = changed.some((id) => id !== "flags.defaultScope" && !RIGHT_AWAY_FLAGS.has(id));
-  const later = "a step already running keeps what it started with";
+  const from = nextSession ? `from your next ${nextSession} session` : "from the next step";
+  const later = nextSession
+    ? `the ${nextSession} session already running keeps what it started with`
+    : "a step already running keeps what it started with";
   const scopeNote = changed.includes("flags.defaultScope") ? "; the default scope applies to new work only" : "";
   if (rightAway.length > 0 && nextStep) {
     const named = rightAway.length === 1
       ? rightAway[0]
       : `${rightAway.slice(0, -1).join(", ")} and ${rightAway[rightAway.length - 1]}`;
-    return `${who} ${verb("pick")} up ${named} right away, with no restart, and the other settings from the next step; ${later}${scopeNote}.`;
+    return `${who} ${verb("pick")} up ${named} right away, with no restart, and the other settings ${from}; ${later}${scopeNote}.`;
   }
   if (rightAway.length > 0) return `${who} ${verb("pick")} this up right away, with no restart${scopeNote}.`;
-  if (nextStep) return `${who} ${verb("pick")} this up from the next step; ${later}${scopeNote}.`;
+  if (nextStep) return `${who} ${verb("pick")} this up ${from}; ${later}${scopeNote}.`;
   if (scopeNote) return `The default scope applies to new work; ${who} ${verb("keep")} the scope it started with.`;
   // The file changed, but what open work reads did not: another file sets the
   // same thing, or outranks it. A saved profile reaches nothing either.
@@ -9963,25 +10659,33 @@ function recordBypassesOnly(
     const switchLines = [...new Set(mutations.flatMap((change) =>
       recordSwitchChange(projectDir, change.target, change.previous, change.next, { otherFiles: false })
     ))];
-    if (options.mode === "human") {
-      writeMenuLines("", context.summaryLines);
-      writeMenuLines("", context.notes.map((note) => `  Note: ${note}`));
-      writeMenuLines("", changes.map((line) => `  ${line}`));
-      writeMenuLines("", notes.map((note) => `  Note: ${note}`));
-      writeMenuLines("", switchLines.map((line) => `  ${line}`));
-    }
     // With several harnesses and none named, no one harness's setup is the
     // person's to finish here.
     const outstandingActions = setupWalkChild || context.anyHarness
       ? []
       : postApplyOutstandingActions(projectDir, context.harnessDir, context.harness);
+    if (options.mode === "human") {
+      // The person sees what changed with its undo, and which check is now
+      // off or on again; anything more only when something still needs them.
+      writeMenuLines("", changes);
+      writeMenuLines("", notes.map((note) => `Note: ${note}`));
+      writeMenuLines("", switchLines);
+      if (changes.length + notes.length + switchLines.length === 0) {
+        writeMenuLines("", [`configured flags settings for ${projectDir}`]);
+      }
+      if (outstandingActions.length > 0) {
+        process.stdout.write(`${menuText(configCompletionMessage("", outstandingActions, "human").trimStart())}\n`);
+      }
+      process.exitCode = EXIT.ok;
+      return;
+    }
     const completion = configCompletionMessage(
       `configured flags settings for ${projectDir}`,
       outstandingActions,
       options.mode,
     );
     emitResult(success(
-      options.mode === "human" ? menuText(completion) : completion,
+      completion,
       {
         projectDir,
         ...(context.anyHarness ? {} : { distribution: context.distribution }),
@@ -10085,6 +10789,8 @@ export async function main(
   input: string[],
   internal: ConfigMainInternal = {},
 ): Promise<void> {
+  // A setup walk's own sections run inside the walk, for the harness it set up.
+  if (!internal.setupWalkChild) configTargetHarnessDir = null;
   let argv = stripVerb(input);
   const options = globalOptions(argv);
   const positionals = configPositionals(argv);
@@ -10648,6 +11354,7 @@ export async function main(
       }
     }
     const { stamp, descriptor } = selected;
+    configTargetHarnessDir = descriptor.harnessDir;
     if (existing.distribution && existing.distribution !== stamp.distribution) {
       throw new Error(`project uses ${existing.distribution}; refusing ${stamp.distribution}`);
     }
@@ -10838,6 +11545,7 @@ export async function main(
       prepared.regenerated,
       retainBaseline,
       prepared.projectOverlays,
+      prepared.unproven,
     );
     for (const rel of prepared.retiredManagedFiles) {
       const target = join(projectDir, rel);
@@ -11331,13 +12039,25 @@ export async function main(
     ];
     // A model policy reaches running work only through the agent files it
     // rewrites; a harness whose agents inherit the session says so in a note.
+    // Kiro CLI reads its agent files and its cli.json effort only when a
+    // session starts, so there the change reaches open work from the next one.
+    const policyHarness = modelHarness(descriptor.distribution);
+    const agentsDir = modelPolicyAgentsDir(policyHarness, descriptor.harnessDir);
+    const kiroCliSettings = policyHarness === "kiro" ? `${descriptor.harnessDir}/settings/cli.json` : null;
     const reachesWork = Boolean(settingsMutation) && (
       !modelsContext ||
-      actions.some((item) => item.path.startsWith(`${descriptor.harnessDir}/agents/`) && item.action !== "preserve")
+      (agentsDir !== null &&
+        actions.some((item) =>
+          item.action !== "preserve" && (item.path.startsWith(`${agentsDir}/`) || item.path === kiroCliSettings)
+        ))
     );
     if (choicesContext?.section === "project") changes.push(...projectChangeLines(projectDir, choicesContext));
     const openLine = recordOnly && reachesWork && settingsMutation
-      ? openWorkflowLine(projectDir, [settingsMutation])
+      ? openWorkflowLine(
+        projectDir,
+        [settingsMutation],
+        modelsContext && policyHarness === "kiro" ? HARNESS_PRODUCT_NAMES.kiro : undefined,
+      )
       : null;
     if (openLine) changes.push(openLine);
     if (!recordOnly) {
@@ -11425,6 +12145,15 @@ export async function main(
     // asked for until the printed command runs again.
     const kiroUnsaved = kiroSession !== null && !kiroSession.ok;
     const completed = kiroUnsaved ? `${completion}; your Kiro session was not saved` : completion;
+    // A model change the person sees ends with what changed and its undo;
+    // anything more only when something still needs them.
+    if (modelsContext && options.mode === "human" && changes.length > 0 && !kiroUnsaved) {
+      if (outstandingActions.length > 0) {
+        process.stdout.write(`${menuText(configCompletionMessage("", outstandingActions, "human").trimStart())}\n`);
+      }
+      process.exitCode = EXIT.ok;
+      return;
+    }
     const configured = success(
       // Only the human line is laid out for the terminal; JSON and --quiet
       // output keep the message exactly.

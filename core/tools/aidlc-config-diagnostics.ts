@@ -33,6 +33,9 @@ import {
   discoverProjectHarnesses,
   kiroTreeLayout,
 } from "./aidlc-runtime-paths.ts";
+import { AIDLC_VERSION } from "./aidlc-version.ts";
+import { compareVersions, VERSION_ID } from "./aidlc-channel.ts";
+import { installedExecutablePath } from "./aidlc-install-paths.ts";
 import { readBoundedRegularFile } from "./aidlc-inline-context.ts";
 import {
   HARNESS_PRODUCT_NAMES,
@@ -3043,6 +3046,7 @@ function selectedHarness(
   root: string;
   harnessDir: string;
   harness: ModelHarness;
+  frameworkVersion?: string;
 } | null {
   const harnesses = discoverProjectHarnesses(projectDir);
   const selected = harnessDirHint
@@ -3054,6 +3058,7 @@ function selectedHarness(
     root: selected.root,
     harnessDir: selected.harnessDir,
     harness: selected.distribution as ModelHarness,
+    ...(selected.frameworkVersion ? { frameworkVersion: selected.frameworkVersion } : {}),
   };
 }
 
@@ -3325,6 +3330,28 @@ export function providerDoctorCheck(
         };
   } catch (error) {
     const path = join(selected.root, "tools", "data", "harness.json");
+    const detail = error instanceof Error ? error.message : String(error);
+    // A newer release may record answers this one does not know (a pinned
+    // project is configured by its pin, while doctor runs on the machine-active
+    // release). That is not a damaged file, and restoring it would discard
+    // valid answers: send the user to the release that wrote it.
+    const writer = selected.frameworkVersion;
+    if (
+      writer && VERSION_ID.test(writer) && VERSION_ID.test(AIDLC_VERSION) &&
+      compareVersions(writer, AIDLC_VERSION) > 0
+    ) {
+      const executable = installedExecutablePath(writer);
+      return {
+        pass: false,
+        severity: "warn",
+        label: `Providers: recorded answers are from aidlc ${writer}, newer than this aidlc ${AIDLC_VERSION}`,
+        // Not the doctor command line itself: VS Code drops output up to a line that repeats it (#1411).
+        fix: (existsSync(executable)
+          ? `run doctor with aidlc ${writer} to check them; it is at \`${executable}\``
+          : `install aidlc ${writer} with \`${aidlcInvocation()} update --version ${writer}\`, then rerun doctor`) +
+          ` (${detail})`,
+      };
+    }
     return {
       pass: false,
       label: "Providers: could not read recorded answers",
@@ -3332,7 +3359,7 @@ export function providerDoctorCheck(
         `restore ${path} from git or re-copy dist/${selected.harness}/${selected.harnessDir}/tools/data/harness.json ` +
         // Not the doctor command itself: VS Code drops output up to a line that repeats it (#1411).
         "from the aidlc-workflows checkout, then run doctor again " +
-        `(${error instanceof Error ? error.message : String(error)})`,
+        `(${detail})`,
     };
   }
 }

@@ -63,6 +63,7 @@ import {
   emptyPickerResult,
   enterHookWorkflow,
   hookStandsOutside,
+  hostEnvelopeTurnText,
   clearPlanApprovalChallenge,
   planApprovalChallengeRelativePath,
   protectedQuestionRelativePath,
@@ -313,6 +314,31 @@ function pickerReplies(input: string): Array<{ question: string; reply: string }
   }
 }
 
+// Every pick a picker reply reports, in its order: one label per question, or
+// several for a multi-select. AskUserQuestion keys answers by question; Codex's
+// request_user_input nests them under each question's own `answers`.
+function pickedLabels(toolResponse: unknown): string[] {
+  let response = toolResponse;
+  if (typeof response === "string") {
+    try { response = JSON.parse(response); } catch { return []; }
+  }
+  if (response === null || typeof response !== "object") return [];
+  const answers = (response as Record<string, unknown>).answers;
+  if (answers === null || typeof answers !== "object") return [];
+  const labels: string[] = [];
+  const add = (value: unknown): void => {
+    if (typeof value === "string") {
+      if (value.trim()) labels.push(value.trim());
+    } else if (Array.isArray(value)) {
+      for (const entry of value) add(entry);
+    } else if (value !== null && typeof value === "object") {
+      add((value as Record<string, unknown>).answers);
+    }
+  };
+  for (const answer of Array.isArray(answers) ? answers : Object.values(answers)) add(answer);
+  return labels;
+}
+
 // Deliberately not exported. This hook mints human authority, so importing the
 // module from project code must not expose a callable function that accepts a
 // fabricated UserPromptSubmit payload. Harnesses and the dispatcher execute it
@@ -345,6 +371,8 @@ try {
   // harness reports it under, so it pairs only with the recorded question.
   let pickerQuestion: PlanApprovalPickerQuestion | undefined;
   let pickerUnanswered = false;
+  // Every pick a picker reply carried, for the record (pickerAnswerNote).
+  let picked: string[] = [];
   try {
     const parsed = JSON.parse(input) as {
       hook_event_name?: unknown;
@@ -360,10 +388,18 @@ try {
     };
     if (typeof parsed.session_id === "string") sessionId = validSessionId(parsed.session_id.trim()) ?? "";
     questionText = extractQuestionText(parsed.tool_input ?? parsed.toolInput);
+    // A host that wraps the person's turn in its own context (Kiro Crew) hands
+    // over the whole envelope as the prompt; only the person's turn is read.
+    // tool_response is a picker payload, never an envelope, and stays as is.
+    const ownTurn = (value: unknown): unknown =>
+      typeof value === "string" ? hostEnvelopeTurnText(value) : value;
+    const prompt = ownTurn(parsed.prompt);
+    const userPrompt = ownTurn(parsed.user_prompt);
+    const message = ownTurn(parsed.message);
     for (const candidate of [
-      parsed.prompt,
-      parsed.user_prompt,
-      parsed.message,
+      prompt,
+      userPrompt,
+      message,
       parsed.tool_response,
       parsed.toolResponse,
     ]) {
@@ -379,12 +415,13 @@ try {
     ) {
       promptSubmitted = true;
       typedPrompt =
-        [parsed.prompt, parsed.user_prompt, parsed.message].find(
+        [prompt, userPrompt, message].find(
           (value): value is string =>
             typeof value === "string" && value.trim().length > 0,
         ) ?? "";
     } else if (parsed.tool_response !== undefined || parsed.toolResponse !== undefined) {
       pickerUnanswered = emptyPickerResult(parsed.tool_response ?? parsed.toolResponse);
+      picked = pickerUnanswered ? [] : pickedLabels(parsed.tool_response ?? parsed.toolResponse);
       pickerQuestion = {
         question: questionText,
         options: extractOptionLabels(parsed.tool_input ?? parsed.toolInput),
@@ -510,6 +547,7 @@ try {
           appendAuditEntryUnlocked("HUMAN_TURN", {
             ...(sessionId ? { Session: sessionId } : {}),
             ...(switchQuestion ? { Reply: QUESTION_TURN_REPLY } : notAReply ? { Reply: COMMAND_TURN_REPLY } : {}),
+            ...(picked.length > 0 ? { Picked: JSON.stringify(picked) } : {}),
           }, projectDir);
           // Keep what the person typed in this chat, so a decision at a stage
           // gate records their own words beside the conductor's reading

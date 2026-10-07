@@ -1783,6 +1783,34 @@ export function classifyTerminalCommand(argv: string[]): TerminalCommand | null 
   return null;
 }
 
+// A host that drives the CLI for the person may deliver each turn as ONE prompt
+// string: its own context blocks first, then a request header, then what the
+// person sent. Kiro Crew does this over ACP, and the whole string is what the
+// UserPromptSubmit hook receives as `prompt`. Measured 2026-10-04 (Crew
+// dashboard driving kiro-cli 2.27): a 34 KB prompt (agent prompt, memory,
+// lessons, a replay of earlier turns, reply rules) ending in
+// "[CURRENT USER REQUEST -- respond to this]\nApprove Plan". Read whole, that
+// reply never matched an offered option, so Plan Approval, typed switches and
+// /aidlc commands sent from Crew were never seen.
+//
+// The person's turn is the text after the LAST header. Crew emits the header
+// with an em dash and folds it to "--" before sending, so both spellings are
+// read. Crew scrubs the header out of everything it splices in, the turn
+// included, and taking the last one means nothing ahead of it (memory, a
+// replayed assistant reply that says "Approve Plan") can be read as the reply
+// even if a forgery slipped through. Only ever a suffix of the prompt is
+// returned, so this never adds text the person did not submit. A prompt
+// without the header is returned unchanged.
+const HOST_TURN_HEADER_RE = /\[CURRENT USER REQUEST (?:--|\u2014) respond to this\]\r?\n/g;
+
+export function hostEnvelopeTurnText(prompt: string): string {
+  let end = -1;
+  for (const match of prompt.matchAll(HOST_TURN_HEADER_RE)) {
+    end = match.index + match[0].length;
+  }
+  return end < 0 ? prompt : prompt.slice(end);
+}
+
 // Kiro's plain-text hook channel must carry UTF-8 without terminal protocol
 // bytes. Keep this transform narrowly scoped to adapter output that is
 // explicitly plain text: structured hook JSON and refusal payloads must retain
@@ -10978,7 +11006,9 @@ const DOCUMENT_AUDIT_EVENTS = new Set([
 // Where the latest human turn stands against the gate resolutions that consume
 // it: "acted" when a turn follows every resolution; "answered" when every
 // resolution provably after the latest turn is an answer record and no question
-// was logged since that turn, so answers already used that reply; "consumed" when some other resolution used it or the
+// was logged since that turn, so answers already used that reply (a question
+// box's reply also backs one answer per pick it carried, whenever its questions
+// were logged); "consumed" when some other resolution used it or the
 // order cannot be proven; "none" when no turn is on record or a listed audit
 // shard could not be read. With `replies`, a turn that was only a command to
 // AIDLC or a question about a switch (its HUMAN_TURN row says `Reply: command`
@@ -11112,6 +11142,9 @@ export function humanTurnState(
   // Questions logged since a turn: a later question's reply is not the one the
   // earlier answers used.
   const decisions: { ts: string; shard: number; pos: number }[] = [];
+  // What a question box carried back (the hook's QUESTION_REPLIED rows, one per
+  // question it asked), under the turn the hook wrote them with.
+  const picks: { shard: number; turn: number }[] = [];
   let sawPresenceTrackingEvent = false;
   const texts: Array<AuditShardText & { shardIndex: number }> = [];
   for (let s = 0; s < shards.length; s++) {
@@ -11137,6 +11170,7 @@ export function humanTurnState(
   for (let t = 0; t < texts.length; t++) {
     const s = texts[t].shardIndex;
     const blocks = auditShardBlocks(texts[t].content);
+    let lastTurn = -1;
     for (let i = 0; i < blocks.length; i++) {
       if (copied[t].has(i)) continue;
       const ev = auditBlockField(blocks[i], "Event");
@@ -11145,6 +11179,8 @@ export function humanTurnState(
       if (ev === "DECISION_RECORDED") {
         decisions.push({ ts: auditBlockField(blocks[i], "Timestamp") ?? "", shard: s, pos: i });
       }
+      if (ev === "HUMAN_TURN") lastTurn = i;
+      if (ev === "QUESTION_REPLIED" && lastTurn >= 0) picks.push({ shard: s, turn: lastTurn });
       // QUESTION_UNANSWERED (hook-owned: a question box closed with no answer)
       // spends any earlier turn, so a remark typed before the box never answers
       // the question asked in it. The question itself stays open.
@@ -11186,7 +11222,7 @@ export function humanTurnState(
   );
   if (latestHumanTimestamp > latestResolutionTimestamp) return "acted";
   if (latestHumanTimestamp < latestResolutionTimestamp) {
-    return usedOnlyByAnswers(humans, resolutions, decisions, latestHumanTimestamp) ? "answered" : "consumed";
+    return usedOnlyByAnswers(humans, resolutions, decisions, picks, latestHumanTimestamp) ? "answered" : "consumed";
   }
 
   // At equal second-precision timestamps, one turn must be provably after EVERY
@@ -11206,17 +11242,21 @@ export function humanTurnState(
     )
   )
     ? "acted"
-    : usedOnlyByAnswers(humans, resolutions, decisions, latestHumanTimestamp) ? "answered" : "consumed";
+    : usedOnlyByAnswers(humans, resolutions, decisions, picks, latestHumanTimestamp) ? "answered" : "consumed";
 }
 
 // True when one human turn holds the latest timestamp, every resolution
 // provably after it is a QUESTION_ANSWERED, and every logged question is
-// provably before it. An event at the same second in another shard is
-// unordered, so it proves nothing about what used the turn or what was asked.
+// provably before it, or the turn was a question box's reply with a pick left
+// for this answer. A question box answers the questions it showed, whenever the
+// agent logs them, so each of its picks backs one answer and no more. An event
+// at the same second in another shard is unordered, so it proves nothing about
+// what used the turn or what was asked.
 function usedOnlyByAnswers(
   humans: { ts: string; shard: number; pos: number }[],
   resolutions: { ts: string; shard: number; pos: number; event: string }[],
   decisions: { ts: string; shard: number; pos: number }[],
+  picks: { shard: number; turn: number }[],
   latestHumanTimestamp: string,
 ): boolean {
   const latest = humans.filter((human) => human.ts === latestHumanTimestamp);
@@ -11225,11 +11265,12 @@ function usedOnlyByAnswers(
   if (resolutions.some((r) => r.ts === turn.ts && r.shard !== turn.shard)) return false;
   const provablyBefore = (e: { ts: string; shard: number; pos: number }) =>
     e.ts < turn.ts || (e.ts === turn.ts && e.shard === turn.shard && e.pos < turn.pos);
-  if (!decisions.every(provablyBefore)) return false;
   const after = resolutions.filter(
     (r) => r.ts > turn.ts || (r.ts === turn.ts && r.shard === turn.shard && r.pos > turn.pos),
   );
-  return after.length > 0 && after.every((r) => r.event === "QUESTION_ANSWERED");
+  if (after.length === 0 || !after.every((r) => r.event === "QUESTION_ANSWERED")) return false;
+  if (decisions.every(provablyBefore)) return true;
+  return after.length < picks.filter((pick) => pick.shard === turn.shard && pick.turn === turn.pos).length;
 }
 
 export function humanActedSinceGate(projectDir: string): boolean {
@@ -16134,6 +16175,9 @@ export interface ReviewerNewFindingReport {
 export interface ReviewerFindingsReport {
   prior: ReviewerPriorFindingReport[];
   newFindings: ReviewerNewFindingReport[];
+  /** The report left out its Prior findings table. A first review has no
+   *  prior findings, so there it reads as empty; a later review is refused. */
+  priorMissing?: true;
 }
 
 export const REVIEW_FINDINGS_REPORT_RETRY_MESSAGE =
@@ -16210,14 +16254,16 @@ export function parseReviewerFindingsReport(
     line.trim().toLowerCase() === "**new findings**"
   );
   if (!hasPrior && !hasNew) return null;
-  if (!hasPrior || !hasNew) {
+  if (!hasNew) {
     throw new Error(REVIEW_FINDINGS_REPORT_RETRY_MESSAGE);
   }
-  const priorTable = reportTable(
-    visible,
-    "Prior findings",
-    ["ID", "Now", "Severity", "Note"],
-  );
+  const priorTable = hasPrior
+    ? reportTable(
+      visible,
+      "Prior findings",
+      ["ID", "Now", "Severity", "Note"],
+    )
+    : { headers: ["ID", "Now", "Severity", "Note"], rows: [] };
   const newTable = reportTable(
     visible,
     "New findings",
@@ -16281,7 +16327,7 @@ export function parseReviewerFindingsReport(
       };
     },
   );
-  return { prior, newFindings };
+  return { prior, newFindings, ...(hasPrior ? {} : { priorMissing: true as const }) };
 }
 
 /**
@@ -26028,6 +26074,36 @@ export function keptRepliesSinceStageStart(
   return replies.length > 0 ? { replies, answered } : null;
 }
 
+// Where the person's latest turn was a picker reply, the note an answer gets
+// when none of their picks carried it: the agent logged a choice they never
+// saw, or one they did not pick. Null when the turn was typed, when a pick
+// matches (its label, with or without the "(Recommended)" decorator), or when
+// the answer is only an option letter or number. It is a note on the record,
+// never a refusal, so it never throws.
+export function pickerAnswerNote(projectDir: string, details: string): string | null {
+  try {
+    const content = readAppendOnlyFileNoFollowOrThrow(auditFilePath(projectDir), "audit shard").toString("utf-8");
+    const blocks = content.replace(/\r\n/g, "\n").split("\n---\n");
+    let turn: string | undefined;
+    for (let index = blocks.length - 1; index >= 0 && turn === undefined; index--) {
+      if (auditBlockField(blocks[index], "Event") === "HUMAN_TURN") turn = blocks[index];
+    }
+    const raw = turn === undefined ? null : auditBlockField(turn, "Picked");
+    if (!raw) return null;
+    const picked = JSON.parse(raw) as unknown;
+    if (!Array.isArray(picked) || picked.length === 0 || !picked.every((pick) => typeof pick === "string")) return null;
+    const plain = (text: string) => stripRecommendedDecorator(text).trim().toLowerCase();
+    const answer = plain(details);
+    if (answer === "" || /^(?:[a-z]|\d+)[.)]?$/.test(answer)) return null;
+    if (picked.some((pick) => plain(pick) === answer || answer.includes(plain(pick)) || plain(pick).includes(answer))) {
+      return null;
+    }
+    return `Not what the person picked in the picker (${picked.map((pick) => `"${pick}"`).join(", ")}).`;
+  } catch {
+    return null;
+  }
+}
+
 // The person's latest chat turn in this clone's ledger for the selected work:
 // when it was, and the words its chat kept right after it (null when the hook
 // kept none: a slash command, a picked option, an over-long message). Null when
@@ -28235,6 +28311,9 @@ function hooksNeverRanHere(projectDir?: string): boolean {
   }
 }
 
+// Said to the agent after every missed-reply step: the person turns a check off, never the agent's offer.
+const NO_CHECK_OFF_OFFER = "Never offer to turn a check off for them.";
+
 export function unattendedHumanPresenceHint(projectDir?: string): string {
   // Explain unattended submissions when relevant.
   if (!humanTurnMintAllowed()) {
@@ -28245,24 +28324,27 @@ export function unattendedHumanPresenceHint(projectDir?: string): string {
   if (personAtOwnTerminal(projectDir)) return ` ${OWN_TERMINAL_PRESENCE_STEP}`;
   // Nothing on record tells a reply not sent yet from one the prompt hook
   // failed to record, so every such refusal also says what happened to a reply
-  // the person did send, and never asks them to send it again. A host that runs
-  // no hooks until the person acts names its own steps; the others name doctor.
+  // the person did send. A host that runs no hooks until the person acts names
+  // its own steps; the others ask once more and name doctor for a repeat.
   // A harness that declares the agent's own step for hooks that are not
   // running gives it here too, so the reply is never asked for again, but
   // only when the record shows the hooks never ran: with a heartbeat there
   // they run, and the step would send the person after a setting already on.
+  // A live run turned an explanation of hooks into an offer to switch human
+  // presence off, so the agent is told plainly never to offer that.
   const agentStep = hooksNeverRanHere(projectDir) ? hooksOffAgentStep(projectDir) : null;
   if (agentStep !== null) {
     return " If the person already replied, that reply was not recorded because AI-DLC's hooks are not " +
-      `running here, so do not ask them to answer again; do this instead: ${agentStep}`;
+      `running here, so do not ask them to answer again; do this instead: ${agentStep} ${NO_CHECK_OFF_OFFER}`;
   }
   const activation = hookActivation();
   const host = activation?.missedReplyInHost;
   const inHost = host?.env.some((name) => Boolean(process.env[name]?.trim())) === true;
   const missedReply = (inHost ? host?.text : activation?.missedReply) ??
-    "If the person already replied, that reply was not recorded for this question. Tell them " +
-      `that, and that ${entrySkillInvocation()} --doctor shows whether AI-DLC's hooks run here.`;
-  return ` ${missedReply}`;
+    "If the person already replied, that reply was not recorded for this question. Tell them exactly this, " +
+      "with nothing about why: \"Your answer didn't reach AI-DLC. Please give it once more. If it happens again, " +
+      `type ${entrySkillInvocation()} --doctor."`;
+  return ` ${missedReply} ${NO_CHECK_OFF_OFFER}`;
 }
 
 export function setField(content: string, field: string, value: string): string {
@@ -35494,6 +35576,7 @@ export function parseMemoryHeadings(raw: string): {
 export function parseMemoryEntries(raw: string): Array<{
   heading: "Interpretations" | "Deviations" | "Tradeoffs" | "Open questions";
   ts: string;
+  unit?: string;
   summary: string;
   context: string;
   raw: string;
@@ -35518,6 +35601,7 @@ export function parseMemoryEntries(raw: string): Array<{
   const entries: Array<{
     heading: "Interpretations" | "Deviations" | "Tradeoffs" | "Open questions";
     ts: string;
+    unit?: string;
     summary: string;
     context: string;
     raw: string;
@@ -35556,37 +35640,42 @@ export function parseMemoryEntries(raw: string): Array<{
 
     // Counted line → one entry. Parse the canonical bullet shape; degrade to
     // raw on any deviation (never throw).
-    const { ts, summary, context } = parseMemoryEntryLine(trimmed);
-    entries.push({ heading: current, ts, summary, context, raw: trimmed });
+    const { ts, unit, summary, context } = parseMemoryEntryLine(trimmed);
+    entries.push({ heading: current, ts, ...(unit === undefined ? {} : { unit }), summary, context, raw: trimmed });
   }
 
   return entries;
 }
 
-// Split a single counted memory line into ts / summary / context. The
+// Split a single counted memory line into ts / unit / summary / context. The
 // canonical shape is `- <ISO> — <summary>; <context>` (stage-protocol.md
 // :876-879). Tolerates a missing `;` (tail → summary, context empty) and a
 // missing ts/em-dash (degrade to summary = the whole line, ts empty).
+// A Unit's iteration of a stage adds `[unit <name>]` after the timestamp.
 function parseMemoryEntryLine(trimmed: string): {
   ts: string;
+  unit?: string;
   summary: string;
   context: string;
 } {
   // Strip a leading list bullet ("- " or "* ").
   const body = trimmed.replace(/^[-*]\s+/, "");
-  // Pull an ISO-8601 timestamp prefix followed by an em-dash separator.
-  const tsMatch = body.match(/^(\S+)\s+—\s+(.*)$/);
+  // Pull an ISO-8601 timestamp prefix, the optional Unit tag, then the
+  // em-dash separator.
+  const tsMatch = body.match(/^(\S+)\s+(?:\[unit:?\s+([^\]\s]+)\]\s+)?\u2014\s+(.*)$/);
   if (!tsMatch) {
     return { ts: "", summary: body, context: "" };
   }
   const ts = tsMatch[1];
-  const rest = tsMatch[2];
+  const tagged = tsMatch[2] === undefined ? {} : { unit: tsMatch[2] };
+  const rest = tsMatch[3];
   const semi = rest.indexOf(";");
   if (semi === -1) {
-    return { ts, summary: rest.trim(), context: "" };
+    return { ts, ...tagged, summary: rest.trim(), context: "" };
   }
   return {
     ts,
+    ...tagged,
     summary: rest.slice(0, semi).trim(),
     context: rest.slice(semi + 1).trim(),
   };
@@ -37113,6 +37202,176 @@ export function ceremonyPolicyValues(
   };
 }
 
+// --- Answer mode (stage-protocol.md section 3, Step 2) ---
+//
+// How the person answers a stage's questions: Guide me, I'll edit the file, or
+// Chat. The first stage with questions asks; later stages in the same piece of
+// work reuse the person's choice and say so in one line. The person changes it
+// by saying so, and the agent records the new choice the same way.
+export type AnswerModeChoice = "guide" | "file" | "chat";
+/** The STAGE_STARTED field recording the mode a stage starts with. */
+export const ANSWER_MODE_FIELD = "Answer Mode";
+/** The recorded Decision text of the mode question starts with this. */
+export const ANSWER_MODE_QUESTION_PREFIX = "How would you like to answer";
+export const ANSWER_MODE_LABELS: Record<AnswerModeChoice, string> = {
+  guide: "Guide me",
+  file: "I'll edit the file",
+  chat: "Chat",
+};
+
+/**
+ * True when a DECISION_RECORDED block is the mode question: it offers exactly
+ * the three ways to answer (the options the agent copies from the protocol),
+ * or its wording starts the way the protocol logs it. The wording varies with
+ * how the agent showed it ("I've created 3 questions at ... How would you
+ * like to answer them?"), so the options decide.
+ */
+export function isAnswerModeDecision(block: string): boolean {
+  if (auditBlockField(block, "Checkpoint") !== null) return false;
+  if ((auditBlockField(block, "Decision") ?? "").trim().startsWith(ANSWER_MODE_QUESTION_PREFIX)) return true;
+  const plain = (text: string) => text.trim().replace(/\u2019/g, "'").toLowerCase();
+  const offered = (auditBlockField(block, "Options") ?? "").split(",").map(plain).filter((option) => option !== "");
+  const labels = Object.values(ANSWER_MODE_LABELS).map(plain);
+  return offered.length === labels.length && labels.every((label) => offered.includes(label));
+}
+const ANSWER_MODE_OTHERS: Record<AnswerModeChoice, string> = {
+  guide: "edit the file or chat",
+  file: "be guided through them here or chat",
+  chat: "be guided through them here or edit the file",
+};
+
+/**
+ * The mode a recorded answer to the mode question names: the option label the
+ * agent recorded, or its option number. The agent reads what the person meant
+ * and records the label; this reads only that exact label or number, so it
+ * never judges the person's own words. Anything else names no mode.
+ */
+export function answerModeFromReply(details: string | null | undefined): AnswerModeChoice | null {
+  if (!details) return null;
+  const text = details
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\u2019/g, "'")
+    .trim()
+    .toLowerCase();
+  const numbered = /^([123])(?:\s*[.):]\s*(.*))?$/.exec(text);
+  const label = numbered ? (numbered[2] ?? "").trim() : text;
+  const byLabel = (Object.keys(ANSWER_MODE_LABELS) as AnswerModeChoice[])
+    .find((mode) => ANSWER_MODE_LABELS[mode].toLowerCase() === label);
+  if (numbered) {
+    const byNumber = (["guide", "file", "chat"] as const)[Number(numbered[1]) - 1];
+    return label === "" || byLabel === byNumber ? byNumber : null;
+  }
+  return byLabel ?? null;
+}
+
+export interface RecordedAnswerMode {
+  mode: AnswerModeChoice;
+  stage: string;
+  timestamp: string;
+}
+
+/**
+ * The person's latest answer to the mode question in this piece of work's
+ * main workflow: a QUESTION_ANSWERED that closes an open DECISION_RECORDED
+ * whose Decision is the mode question (the same pairing hasPendingDecision
+ * reads). Isolated `--single` rows never count. Null when none names a mode.
+ */
+export function latestRecordedAnswerMode(
+  projectDir: string,
+  intent?: string,
+  space?: string,
+): RecordedAnswerMode | null {
+  let rows: AuditShardEvent[];
+  try {
+    rows = readAuditShardEvents(projectDir, intent, space);
+  } catch {
+    return null;
+  }
+  const events = rows
+    .filter((row) => DECISION_PAIRING_EVENTS.has(row.event))
+    .filter((row) => !(auditBlockField(row.block, "Workflow") ?? "").startsWith("single-stage:"))
+    .sort((a, b) => {
+      if (a.timestamp !== b.timestamp) return a.timestamp < b.timestamp ? -1 : 1;
+      if (a.shardIndex !== b.shardIndex) return a.shardIndex - b.shardIndex;
+      return a.pos - b.pos;
+    });
+  const open = new Map<string, string | null>();
+  let latest: RecordedAnswerMode | null = null;
+  for (const row of events) {
+    const stage = auditBlockField(row.block, "Stage");
+    if (stage === null) continue;
+    const key = `${stage}\u0000${auditBlockField(row.block, "Unit") ?? ""}`;
+    const before = open.get(key) ?? null;
+    const after = nextOpenDecision(before, row.event, row.block);
+    if (
+      before !== null && after === null && row.event === "QUESTION_ANSWERED" && isAnswerModeDecision(before)
+    ) {
+      const mode = answerModeFromReply(auditBlockField(row.block, "Details"));
+      if (mode !== null) latest = { mode, stage, timestamp: row.timestamp };
+    }
+    open.set(key, after);
+  }
+  return latest;
+}
+
+export interface StageAnswerMode {
+  /** The mode this stage uses without asking; null when it asks. */
+  mode: AnswerModeChoice | null;
+  /** True when this stage presents the mode question before its questions. */
+  ask: boolean;
+  /** The stage whose recorded answer is reused, when the mode came from one. */
+  reused_from: string | null;
+  /** The one line the conductor shows the person about the mode. */
+  notice: string;
+}
+
+/**
+ * The answer mode one stage runs with. `projectDir` null skips the recorded
+ * choice (a piece of work being created, or an isolated run, has none).
+ */
+export function resolveStageAnswerMode(
+  projectDir: string | null,
+  options: { intent?: string; space?: string } = {},
+): StageAnswerMode {
+  const recorded = projectDir === null ? null : latestRecordedAnswerMode(projectDir, options.intent, options.space);
+  if (recorded !== null) {
+    return {
+      mode: recorded.mode,
+      ask: false,
+      reused_from: recorded.stage,
+      notice: `Answering the way you chose earlier: ${ANSWER_MODE_LABELS[recorded.mode]}. ` +
+        `Say if you'd rather ${ANSWER_MODE_OTHERS[recorded.mode]}.`,
+    };
+  }
+  return {
+    mode: null,
+    ask: true,
+    reused_from: null,
+    notice: "Later stages will use this way too. Say any time if you'd rather switch.",
+  };
+}
+
+/**
+ * STAGE_STARTED fields recording a reused answer mode, e.g.
+ * `Answer Mode: guide (reused from requirements-analysis)`, so the audit shows
+ * how a stage that asked no mode question was answered. Empty when the stage
+ * asks (its own question and answer are the record) and on any read error.
+ */
+export function answerModeStageStartedFields(
+  projectDir: string | null,
+  options: { intent?: string; space?: string } = {},
+): Record<string, string> {
+  try {
+    const mode = resolveStageAnswerMode(projectDir, options);
+    return mode.mode !== null && mode.reused_from !== null
+      ? { [ANSWER_MODE_FIELD]: `${mode.mode} (reused from ${mode.reused_from})` }
+      : {};
+  } catch {
+    return {};
+  }
+}
+
 /**
  * The collaborators a stage ACTUALLY gets for this run — the single owner of
  * the collaborators switch. Returns the stage's declared `support_agents`, or
@@ -37442,6 +37701,8 @@ export function parseTypedGuardSwitchRequest(prompt: string, options: { wordsAns
   newWorkGuardPolicy?: "relaxed" | "off";
   /** Sensors, learnings or summary confirmation typed as flags of the new work the message describes. */
   newWorkCeremonies?: Record<string, "on" | "off">;
+  /** `--guard.<fence> off` typed as flags of the new work the message describes. */
+  newWorkFencesOff?: SwitchableGuardFence[];
   /** The plain-words switch asked as a question ("skip plan approval?"). */
   asked?: true;
   /** The words typed after the flags, when there are any. */
@@ -37585,7 +37846,12 @@ export function parseTypedGuardSwitchRequest(prompt: string, options: { wordsAns
     } else {
       if (!currentKey.startsWith("guard.")) continue;
       const fence = currentKey.slice("guard.".length);
-      if (!isSwitchableGuardFence(fence) || normalizedValue !== "off") continue;
+      if (!isSwitchableGuardFence(fence)) continue;
+      // The last value wins here too, so a later on drops an earlier off.
+      if (normalizedValue !== "off") {
+        switches.delete(`guard.${fence}`);
+        continue;
+      }
       key = `guard.${fence}`;
     }
     if (normalizedValue === "relaxed" || normalizedValue === "off") {
@@ -37619,6 +37885,14 @@ export function parseTypedGuardSwitchRequest(prompt: string, options: { wordsAns
     switches.delete("guard-policy");
     settings.delete("guard-policy");
   }
+  // So is a check turned off with it, when off is the last word typed for it.
+  const newWorkFencesOff: SwitchableGuardFence[] = [];
+  for (const fence of SWITCHABLE_GUARD_FENCES) {
+    if (!forNewWork || fence === "plan-approval" || settings.get(`guard.${fence}`) !== "off") continue;
+    newWorkFencesOff.push(fence);
+    switches.delete(`guard.${fence}`);
+    settings.delete(`guard.${fence}`);
+  }
   return {
     switches: [...switches.values()],
     settings: [...settings].map(([key, value]) => ({ key, value })),
@@ -37629,6 +37903,7 @@ export function parseTypedGuardSwitchRequest(prompt: string, options: { wordsAns
     ...(newWorkPlanApprovalOff ? { newWorkPlanApprovalOff: true as const } : {}),
     ...(newWorkGuardPolicy ? { newWorkGuardPolicy } : {}),
     ...(Object.keys(newWorkCeremonies).length > 0 ? { newWorkCeremonies } : {}),
+    ...(newWorkFencesOff.length > 0 ? { newWorkFencesOff } : {}),
     ...(words.length > 0 ? { words: words.join(" ") } : {}),
   };
 }

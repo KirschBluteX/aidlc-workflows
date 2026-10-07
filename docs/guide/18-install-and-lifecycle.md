@@ -234,7 +234,8 @@ The installer:
 1. Downloads or reads `version.json`, `checksums.txt`, and
    `aidlc-release.intoto.jsonl`.
 2. When a compatible GitHub CLI is available, verifies the `checksums.txt`
-   attestation against the repository and signer workflow.
+   attestation against the repository and signer workflow on `github.com`,
+   even when the GitHub CLI's default host is a GitHub Enterprise host.
 3. Verifies the `version.json` SHA-256, reads its version id and source
    identity, and rejects an explicit version mismatch before downloading or
    executing a release binary.
@@ -247,17 +248,20 @@ The installer:
 6. Lets the verified binary validate and transactionally install the release.
 
 To authenticate the bootstrap script itself before execution, use a current
-GitHub CLI:
+GitHub CLI. The `github.com/` repository prefix and `--hostname github.com`
+keep these commands on github.com when your `gh` defaults to a GitHub
+Enterprise host:
 
 ```bash
 tmp="$(mktemp -d)"
-tag="$(gh release view --repo awslabs/aidlc-workflows --json tagName --jq .tagName)"
-gh release download "$tag" --repo awslabs/aidlc-workflows --dir "$tmp" \
+tag="$(gh release view --repo github.com/awslabs/aidlc-workflows --json tagName --jq .tagName)"
+gh release download "$tag" --repo github.com/awslabs/aidlc-workflows --dir "$tmp" \
   --pattern install.sh --pattern aidlc-release.intoto.jsonl
 gh attestation verify "$tmp/install.sh" \
   --bundle "$tmp/aidlc-release.intoto.jsonl" \
   --repo awslabs/aidlc-workflows \
   --signer-workflow awslabs/aidlc-workflows/.github/workflows/release.yml \
+  --hostname github.com \
   --source-ref "refs/tags/$tag"
 sh "$tmp/install.sh" --version "${tag#v}"
 rm -rf "$tmp"
@@ -469,6 +473,9 @@ aidlc config models --reset --project --yes
 aidlc config models --session-model claude-opus-4.8   # Kiro CLI: your personal session model
 ```
 
+A change ends with what changed, its undo command and who picks it up (plus
+any setup step still outstanding); `--json` and `--quiet` output are unchanged.
+
 `--show --json` prints every agent's effective model, effort, and provenance.
 `--check` is the CI inverse and exits non-zero when the recorded policy is not
 fully reflected in the harness surfaces.
@@ -543,10 +550,13 @@ Kiro settings
 ([Session model and effort](harnesses/kiro-cli.md#session-model-and-effort));
 explicit group dials have no Kiro surface, and a per-agent model exception
 carries its effort through the project's `chat.modelDefaults`, which then
-replaces your personal effort map in that project. Kiro IDE, Cursor, and GitHub Copilot cannot portably pin
-agent models or effort, so setup records no preset there; a policy you record
-anyway is kept, and the command reports the unsupported fields instead of
-writing inert keys. On those three, every agent uses the session's model and
+replaces your personal effort map in that project. An effort set on Kiro CLI
+without a model is kept for other tools, and the command says so in one line.
+Kiro IDE, Cursor, and GitHub Copilot cannot portably pin
+agent models or effort, so setup records no preset there. A model or effort you
+set anyway is kept for teammates on tools that apply it, writes no inert keys,
+and the command says in one line that this tool uses the model you choose in its
+own model picker. On those three, every agent uses the session's model and
 effort: the setup check and `aidlc doctor` say so instead of asking for a
 policy, and doctor warns only about an agent model recorded for that harness
 by name.
@@ -844,6 +854,9 @@ The recordable bypass set includes the documented recovery and ceremony switches
 
 The wizard never offers bypasses. They require an explicit `--bypass <name>`;
 `--show` surfaces every enabled bypass and its guard-weakening consequence.
+Recording or clearing one prints only what changed with its undo command and
+the line for the check it switched (plus any setup step still outstanding);
+`--json` and `--quiet` output are unchanged.
 Every bypass except usage tracking, sensors, and learnings takes a check away
 from the person, so while one is on AI-DLC says so in one line: on the next
 step, at the start of every chat (not on opencode, which shows no session-start
@@ -962,7 +975,9 @@ release. Each prints what changed and, where one command
 puts the earlier value back, that command. A model or flag change also names
 the open workflows that pick it up: a bypass, hook debug, the sensor timeout,
 and question retention apply right away, with no restart; models and swarm
-apply from the next step (a step already running keeps what it started with);
+apply from the next step (a step already running keeps what it started with),
+except that on Kiro CLI a model or effort change applies from your next Kiro CLI
+session, since a running one keeps what it started with;
 a default scope applies to new work only, and a saved model profile changes
 nothing until `--from` loads it. The runtime, providers, and trust answers
 print no workflow line.
@@ -1040,20 +1055,33 @@ one. Environment and other top-level settings (including `disableAllHooks`)
 stay yours, except for values attributed to recorded provider or project
 answers.
 
-Provider, scope, and model answers preserve project-owned fields in
-`.codex/config.toml`. The Codex `[shell_environment_policy]`,
-`[sandbox_workspace_write]`, `[agents]`, `[features]`, `[tools]`, and `[tui]`
-tables remain framework-owned. Local edits to those entries conflict
-against the baseline, and `--force` restores the shipped entries while
+`.codex/config.toml` belongs to the project as well; AI-DLC contributes its
+settings key by key: `developer_instructions`, `sandbox_mode`,
+`suppress_unstable_features_warning`, `tool_output_token_limit`, and the keys
+it ships in the `[shell_environment_policy]`, `[sandbox_workspace_write]`, `[agents]`,
+`[features]`, `[tools]`, and `[tui]` tables. A refresh, including those
+accompanying provider, scope, or model answers, changes only those keys and
+keeps every other byte: your own keys (also inside AI-DLC's tables), your own
+tables (such as `[agents.<role>]` or `[mcp_servers.<name>]`), comments, order,
+and spelling. An AI-DLC value nobody changed takes the release's value; a value
+you changed stays yours, with a note when a release ships a different one
+(delete the key and refresh to take it); a deleted AI-DLC key comes back, with
+a note. The active space's `AIDLC_RULES_DIR` stays as it is. A project that
+already has its own `.codex/config.toml` keeps it on first install, and AI-DLC
+adds its settings. A file the refresh cannot merge safely (it does not parse,
+or uses one of AI-DLC's table names for something else, such as an array of
+tables) still reports a conflict; `--force` then restores AI-DLC's tables while
 retaining unrelated project-owned fields. An explicit `--from` selects that
 source instead of the project's copy.
 
-Human output prints `Note:` when AI-DLC entries in `.claude/settings.json`
-were restored, and when a custom Claude statusline or announcement was kept
+Human output prints `Note:` when AI-DLC entries in `.claude/settings.json` or
+`.codex/config.toml` were restored or added, and when your own value for one of
+them (a custom Claude statusline or announcement, or a Codex key) was kept
 while this release ships a different one; JSON output exposes the same
-messages in `data.notes`. To restore them, use `aidlc config --harness claude`,
-not the bare interactive setup walk. Copy-channel projects also pass
-`--from <the runtime/claude root you copied from>`.
+messages in `data.notes`. To restore them, use `aidlc config --harness claude`
+or `aidlc config --harness codex`, not the bare interactive setup walk.
+Copy-channel projects also pass `--from <the runtime/<harness> root you copied
+from>`.
 
 `opencode.json` belongs to the team: config adds AI-DLC's entries to it and
 keeps every other key, value, comment, and line. Provider answers edit only
@@ -1370,12 +1398,13 @@ A fresh clone or CI runner installs the committed version before config:
 version=$(cat .aidlc-version)
 tag="v$version"
 tmp="$(mktemp -d)"
-gh release download "$tag" --repo awslabs/aidlc-workflows --dir "$tmp" \
+gh release download "$tag" --repo github.com/awslabs/aidlc-workflows --dir "$tmp" \
   --pattern install.sh --pattern aidlc-release.intoto.jsonl
 gh attestation verify "$tmp/install.sh" \
   --bundle "$tmp/aidlc-release.intoto.jsonl" \
   --repo awslabs/aidlc-workflows \
   --signer-workflow awslabs/aidlc-workflows/.github/workflows/release.yml \
+  --hostname github.com \
   --source-ref "refs/tags/$tag"
 sh "$tmp/install.sh" --version "$version" --quiet --yes
 rm -rf "$tmp"
@@ -1399,7 +1428,7 @@ fails closed if the bundle is missing or does not authenticate
 `checksums.txt`:
 
 ```bash
-gh release download v2.5.45 --repo awslabs/aidlc-workflows --dir ./aidlc-offline
+gh release download v2.5.45 --repo github.com/awslabs/aidlc-workflows --dir ./aidlc-offline
 ```
 
 Install on the disconnected machine:
@@ -1645,7 +1674,7 @@ runtime_asset="aidlc-copy-runtime-${tag#v}.tar.gz"
 runtime_checksum="${runtime_asset}.sha256"
 source_repo="${AIDLC_RELEASE_REPOSITORY:-awslabs/aidlc-workflows}"
 release_workflow="${AIDLC_RELEASE_WORKFLOW:-$source_repo/.github/workflows/release.yml}"
-gh release download "$tag" --repo "$source_repo" --dir "$tmp" \
+gh release download "$tag" --repo "github.com/$source_repo" --dir "$tmp" \
   --pattern "$runtime_asset" \
   --pattern "$runtime_checksum" \
   --pattern aidlc-release.intoto.jsonl
@@ -1653,6 +1682,7 @@ gh attestation verify "$tmp/$runtime_asset" \
   --bundle "$tmp/aidlc-release.intoto.jsonl" \
   --repo "$source_repo" \
   --signer-workflow "$release_workflow" \
+  --hostname github.com \
   --source-ref "refs/tags/$tag"
 (cd "$tmp" && sha256sum -c "$runtime_checksum")
 tar -xzf "$tmp/$runtime_asset" -C "$tmp"
@@ -1719,11 +1749,17 @@ Uninstall uses an explicit list of installer-owned files and checks their
 contents before deleting them. It does not recursively remove installation or
 version directories. Directories are removed only when empty; project trees,
 unlisted files, changed files, and linked targets are preserved. The result
-reports unowned or changed paths kept for review.
+lists, once, each path it left because AI-DLC did not install it or it changed
+after install.
 
 New installations record a full per-version `installed-files.json` inventory,
 whose hash is stored in `version.json`. Older installations use their verified
-runtime inventory where available; files without ownership evidence are kept.
+runtime inventory where available, plus the plugin folders their release
+unpacked beside it, which carry the marker the release build wrote; other files
+without ownership evidence are kept. A shell completion counts as AI-DLC's when
+it is exactly what an AI-DLC release renders, so the completions an earlier
+release wrote while it updated to this one are removed, and an edited one is
+kept.
 Without `--purge`, machine config, update cache, pin registrations, and the
 default harness are also preserved. `--purge` selects those known machine
 records for removal; it does not broaden deletion to unrelated files.
@@ -1740,7 +1776,8 @@ project roots, as well as root-owned, package-manager-owned, or
 mixed-ownership commands. On Windows, a bound file list and expected checksums
 are recorded before cleanup is scheduled. The worker rechecks paths and hashes,
 refuses reparse points, and deletes files individually after the running command
-exits. An interrupted continuation can resume only with its validated file plan.
+exits; uninstall is done when the `aidlc` command is no longer found. An
+interrupted continuation can resume only with its validated file plan.
 Older journals without such a plan are refused and left for inspection. See
 [Transactions and Recovery](#transactions-and-recovery) for how a failed
 cleanup is reported and retried.
